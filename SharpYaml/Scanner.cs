@@ -1,15 +1,15 @@
 // Copyright (c) 2015 SharpYaml - Alexandre Mutel
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -17,24 +17,24 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
-// 
+//
 // -------------------------------------------------------------------------------
 // SharpYaml is a fork of YamlDotNet https://github.com/aaubry/YamlDotNet
 // published with the following license:
 // -------------------------------------------------------------------------------
-// 
+//
 // Copyright (c) 2008, 2009, 2010, 2011, 2012 Antoine Aubry
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy of
 // this software and associated documentation files (the "Software"), to deal in
 // the Software without restriction, including without limitation the rights to
 // use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
 // of the Software, and to permit persons to whom the Software is furnished to do
 // so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in all
 // copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -51,2329 +51,2330 @@ using SharpYaml.Tokens;
 
 namespace SharpYaml
 {
-	/// <summary>
-	/// Converts a sequence of characters into a sequence of YAML tokens.
-	/// </summary>
-	public class Scanner
-	{
-		private const int MaxVersionNumberLength = 9;
-
-		private readonly Stack<int> indents = new Stack<int>();
-		private readonly InsertionQueue<Token> tokens = new InsertionQueue<Token>();
-		private readonly Stack<SimpleKey> simpleKeys = new Stack<SimpleKey>();
-
-		// Used by ScanFlowScalar, this will reduce memory usage by /2
-		private readonly StringBuilder scanScalarValue = new StringBuilder();
-		private readonly StringBuilder scanScalarWhitespaces = new StringBuilder();
-		private readonly StringBuilder scanScalarLeadingBreak = new StringBuilder();
-		private readonly StringBuilder scanScalarTrailingBreaks = new StringBuilder();
-
-
-		private bool streamStartProduced;
-		private bool streamEndProduced;
-		private int indent = -1;
-		private bool simpleKeyAllowed;
-		private Mark mark;
-
-		/// <summary>
-		/// Gets the current position inside the input stream.
-		/// </summary>
-		/// <value>The current position.</value>
-		public Mark CurrentPosition
-		{
-			get
-			{
-				return mark;
-			}
-		}
-
-		private int flowLevel;
-		private int tokensParsed;
-
-		private const int MaxBufferLength = 8;
-		private readonly CharacterAnalyzer<LookAheadBuffer> analyzer;
-		private bool tokenAvailable;
-
-		private static readonly IDictionary<char, char> simpleEscapeCodes = InitializeSimpleEscapeCodes();
-
-		private static IDictionary<char, char> InitializeSimpleEscapeCodes()
-		{
-			IDictionary<char, char> codes = new SortedDictionary<char, char>();
-			codes.Add('0', '\0');
-			codes.Add('a', '\x07');
-			codes.Add('b', '\x08');
-			codes.Add('t', '\x09');
-			codes.Add('\t', '\x09');
-			codes.Add('n', '\x0A');
-			codes.Add('v', '\x0B');
-			codes.Add('f', '\x0C');
-			codes.Add('r', '\x0D');
-			codes.Add('e', '\x1B');
-			codes.Add(' ', '\x20');
-			codes.Add('"', '"');
-			codes.Add('\'', '\'');
-			codes.Add('\\', '\\');
-			codes.Add('N', '\x85');
-			codes.Add('_', '\xA0');
-			codes.Add('L', '\x2028');
-			codes.Add('P', '\x2029');
-			return codes;
-		}
-
-		private char ReadCurrentCharacter()
-		{
-			char currentCharacter = analyzer.Peek(0);
-			Skip();
-			return currentCharacter;
-		}
-
-		private char ReadLine()
-		{
-			if (analyzer.Check("\r\n\x85")) // CR LF -> LF  --- CR|LF|NEL -> LF
-			{
-				SkipLine();
-				return '\n';
-			}
-
-			char nextChar = analyzer.Peek(0); // LS|PS -> LS|PS
-			SkipLine();
-			return nextChar;
-		}
-
-		/// <summary>
-		/// Initializes a new instance of the <see cref="Scanner"/> class.
-		/// </summary>
-		/// <param name="input">The input.</param>
-		public Scanner(TextReader input)
-		{
-			analyzer = new CharacterAnalyzer<LookAheadBuffer>(new LookAheadBuffer(input, MaxBufferLength));
-			mark.Column = 0;
-			mark.Line = 0;
-		}
-
-		private Token current;
-
-		/// <summary>
-		/// Gets the current token.
-		/// </summary>
-		public Token Current
-		{
-			get
-			{
-				return current;
-			}
-		}
-
-		/// <summary>
-		/// Moves to the next token.
-		/// </summary>
-		/// <returns></returns>
-		public bool MoveNext()
-		{
-			if (current != null)
-			{
-				ConsumeCurrent();
-			}
-
-			return InternalMoveNext();
-		}
-
-		internal bool InternalMoveNext()
-		{
-			if (!tokenAvailable && !streamEndProduced)
-			{
-				FetchMoreTokens();
-			}
-			if (tokens.Count > 0)
-			{
-				current = tokens.Dequeue();
-				tokenAvailable = false;
-				return true;
-			}
-			else
-			{
-				current = null;
-				return false;
-			}
-		}
-
-		/// <summary>
-		/// Consumes the current token and increments the parsed token count
-		/// </summary>
-		internal void ConsumeCurrent()
-		{
-			++tokensParsed;
-			tokenAvailable = false;
-			current = null;
-		}
-
-		private void FetchMoreTokens()
-		{
-			// While we need more tokens to fetch, do it.
-
-			while (true)
-			{
-				// Check if we really need to fetch more tokens.
-
-				bool needsMoreTokens = false;
-
-				if (tokens.Count == 0)
-				{
-					// Queue is empty.
-
-					needsMoreTokens = true;
-				}
-				else
-				{
-					// Check if any potential simple key may occupy the head position.
-
-					StaleSimpleKeys();
-
-					foreach(var simpleKey in simpleKeys)
-					{
-						if (simpleKey.IsPossible && simpleKey.TokenNumber == tokensParsed)
-						{
-							needsMoreTokens = true;
-							break;
-						}
-					}
-				}
-
-				// We are finished.
-				if (!needsMoreTokens)
-				{
-					break;
-				}
-
-				// Fetch the next token.
-
-				FetchNextToken();
-			}
-			tokenAvailable = true;
-		}
-
-		private static bool StartsWith(StringBuilder what, char start)
-		{
-			return what.Length > 0 && what[0] == start;
-		}
-
-		/// <summary>
-		/// Check the list of potential simple keys and remove the positions that
-		/// cannot contain simple keys anymore.
-		/// </summary>
-
-		private void StaleSimpleKeys()
-		{
-			// Check for a potential simple key for each flow level.
-
-			foreach(var key in simpleKeys)
-			{
-
-				// The specification requires that a simple key
-
-				//  - is limited to a single line,
-				//  - is shorter than 1024 characters.
-
-
-				if (key.IsPossible && (key.Mark.Line < mark.Line || key.Mark.Index + 1024 < mark.Index))
-				{
-
-					// Check if the potential simple key to be removed is required.
-
-					if (key.IsRequired)
-					{
-						throw new SyntaxErrorException(mark, mark, "While scanning a simple key, could not find expected ':'.");
-					}
-
-					key.IsPossible = false;
-				}
-			}
-		}
-
-		private void FetchNextToken()
-		{
-			// Check if we just started scanning.  Fetch STREAM-START then.
-
-			if (!streamStartProduced)
-			{
-				FetchStreamStart();
-				return;
-			}
-
-			// Eat whitespaces and comments until we reach the next token.
-
-			ScanToNextToken();
-
-			// Remove obsolete potential simple keys.
-
-			StaleSimpleKeys();
-
-			// Check the indentation level against the current column.
-
-			UnrollIndent(mark.Column);
-
-
-			// Ensure that the buffer contains at least 4 characters.  4 is the length
-			// of the longest indicators ('--- ' and '... ').
-
-
-			analyzer.Buffer.Cache(4);
-
-			// Is it the end of the stream?
-
-			if (analyzer.Buffer.EndOfInput)
-			{
-				FetchStreamEnd();
-				return;
-			}
-
-			// Is it a directive?
-
-			if (mark.Column == 0 && analyzer.Check('%'))
-			{
-				FetchDirective();
-				return;
-			}
-
-			// Is it the document start indicator?
-
-			bool isDocumentStart =
-				mark.Column == 0 &&
-				analyzer.Check('-', 0) &&
-				analyzer.Check('-', 1) &&
-				analyzer.Check('-', 2) &&
-				analyzer.IsBlankOrBreakOrZero(3);
-
-			if (isDocumentStart)
-			{
-				FetchDocumentIndicator(true);
-				return;
-			}
-
-			// Is it the document end indicator?
-
-			bool isDocumentEnd =
-				mark.Column == 0 &&
-				analyzer.Check('.', 0) &&
-				analyzer.Check('.', 1) &&
-				analyzer.Check('.', 2) &&
-				analyzer.IsBlankOrBreakOrZero(3);
-
-			if (isDocumentEnd)
-			{
-				FetchDocumentIndicator(false);
-				return;
-			}
-
-			// Is it the flow sequence start indicator?
-
-			if (analyzer.Check('['))
-			{
-				FetchFlowCollectionStart(true);
-				return;
-			}
-
-			// Is it the flow mapping start indicator?
-
-			if (analyzer.Check('{'))
-			{
-				FetchFlowCollectionStart(false);
-				return;
-			}
-
-			// Is it the flow sequence end indicator?
-
-			if (analyzer.Check(']'))
-			{
-				FetchFlowCollectionEnd(true);
-				return;
-			}
-
-			// Is it the flow mapping end indicator?
-
-			if (analyzer.Check('}'))
-			{
-				FetchFlowCollectionEnd(false);
-				return;
-			}
-
-			// Is it the flow entry indicator?
-
-			if (analyzer.Check(','))
-			{
-				FetchFlowEntry();
-				return;
-			}
-
-			// Is it the block entry indicator?
+    /// <summary>
+    /// Converts a sequence of characters into a sequence of YAML tokens.
+    /// </summary>
+    public class Scanner
+    {
+        private const int MaxVersionNumberLength = 9;
+
+        private readonly Stack<int> indents = new Stack<int>();
+        private readonly InsertionQueue<Token> tokens = new InsertionQueue<Token>();
+        private readonly Stack<SimpleKey> simpleKeys = new Stack<SimpleKey>();
+
+        // Used by ScanFlowScalar, this will reduce memory usage by /2
+        private readonly StringBuilder scanScalarValue = new StringBuilder();
+        private readonly StringBuilder scanScalarWhitespaces = new StringBuilder();
+        private readonly StringBuilder scanScalarLeadingBreak = new StringBuilder();
+        private readonly StringBuilder scanScalarTrailingBreaks = new StringBuilder();
+
+
+        private bool streamStartProduced;
+        private bool streamEndProduced;
+        private int indent = -1;
+        private bool simpleKeyAllowed;
+        private Mark mark;
+
+        /// <summary>
+        /// Gets the current position inside the input stream.
+        /// </summary>
+        /// <value>The current position.</value>
+        public Mark CurrentPosition
+        {
+            get
+            {
+                return mark;
+            }
+        }
+
+        private int flowLevel;
+        private int tokensParsed;
+
+        private const int MaxBufferLength = 8;
+        private readonly CharacterAnalyzer<LookAheadBuffer> analyzer;
+        private bool tokenAvailable;
+
+        private static readonly IDictionary<char, char> simpleEscapeCodes = InitializeSimpleEscapeCodes();
+
+        private static IDictionary<char, char> InitializeSimpleEscapeCodes()
+        {
+            IDictionary<char, char> codes = new SortedDictionary<char, char>();
+            codes.Add('0', '\0');
+            codes.Add('a', '\x07');
+            codes.Add('b', '\x08');
+            codes.Add('t', '\x09');
+            codes.Add('\t', '\x09');
+            codes.Add('n', '\x0A');
+            codes.Add('v', '\x0B');
+            codes.Add('f', '\x0C');
+            codes.Add('r', '\x0D');
+            codes.Add('e', '\x1B');
+            codes.Add(' ', '\x20');
+            codes.Add('"', '"');
+            codes.Add('\'', '\'');
+            codes.Add('\\', '\\');
+            codes.Add('N', '\x85');
+            codes.Add('_', '\xA0');
+            codes.Add('L', '\x2028');
+            codes.Add('P', '\x2029');
+            return codes;
+        }
+
+        private char ReadCurrentCharacter()
+        {
+            char currentCharacter = analyzer.Peek(0);
+            Skip();
+            return currentCharacter;
+        }
+
+        private char ReadLine()
+        {
+            if (analyzer.Check("\r\n\x85")) // CR LF -> LF  --- CR|LF|NEL -> LF
+            {
+                SkipLine();
+                return '\n';
+            }
+
+            char nextChar = analyzer.Peek(0); // LS|PS -> LS|PS
+            SkipLine();
+            return nextChar;
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Scanner"/> class.
+        /// </summary>
+        /// <param name="input">The input.</param>
+        public Scanner(TextReader input)
+        {
+            analyzer = new CharacterAnalyzer<LookAheadBuffer>(new LookAheadBuffer(input, MaxBufferLength));
+            mark.Column = 0;
+            mark.Line = 0;
+        }
+
+        private Token current;
+
+        /// <summary>
+        /// Gets the current token.
+        /// </summary>
+        public Token Current
+        {
+            get
+            {
+                return current;
+            }
+        }
+
+        /// <summary>
+        /// Moves to the next token.
+        /// </summary>
+        /// <returns></returns>
+        public bool MoveNext()
+        {
+            if (current != null)
+            {
+                ConsumeCurrent();
+            }
+
+            return InternalMoveNext();
+        }
+
+        internal bool InternalMoveNext()
+        {
+            if (!tokenAvailable && !streamEndProduced)
+            {
+                FetchMoreTokens();
+            }
+            if (tokens.Count > 0)
+            {
+                current = tokens.Dequeue();
+                tokenAvailable = false;
+                return true;
+            }
+            else
+            {
+                current = null;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Consumes the current token and increments the parsed token count
+        /// </summary>
+        internal void ConsumeCurrent()
+        {
+            ++tokensParsed;
+            tokenAvailable = false;
+            current = null;
+        }
+
+        private void FetchMoreTokens()
+        {
+            // While we need more tokens to fetch, do it.
+
+            while (true)
+            {
+                // Check if we really need to fetch more tokens.
+
+                bool needsMoreTokens = false;
+
+                if (tokens.Count == 0)
+                {
+                    // Queue is empty.
+
+                    needsMoreTokens = true;
+                }
+                else
+                {
+                    // Check if any potential simple key may occupy the head position.
+
+                    StaleSimpleKeys();
+
+                    foreach(var simpleKey in simpleKeys)
+                    {
+                        if (simpleKey.IsPossible && simpleKey.TokenNumber == tokensParsed)
+                        {
+                            needsMoreTokens = true;
+                            break;
+                        }
+                    }
+                }
+
+                // We are finished.
+                if (!needsMoreTokens)
+                {
+                    break;
+                }
+
+                // Fetch the next token.
+
+                FetchNextToken();
+            }
+            tokenAvailable = true;
+        }
+
+        private static bool StartsWith(StringBuilder what, char start)
+        {
+            return what.Length > 0 && what[0] == start;
+        }
+
+        /// <summary>
+        /// Check the list of potential simple keys and remove the positions that
+        /// cannot contain simple keys anymore.
+        /// </summary>
+
+        private void StaleSimpleKeys()
+        {
+            // Check for a potential simple key for each flow level.
+
+            foreach(var key in simpleKeys)
+            {
+
+                // The specification requires that a simple key
+
+                //  - is limited to a single line,
+                //  - is shorter than 1024 characters.
+
+
+                if (key.IsPossible && (key.Mark.Line < mark.Line || key.Mark.Index + 1024 < mark.Index))
+                {
+
+                    // Check if the potential simple key to be removed is required.
+
+                    if (key.IsRequired)
+                    {
+                        throw new SyntaxErrorException(mark, mark, "While scanning a simple key, could not find expected ':'.");
+                    }
+
+                    key.IsPossible = false;
+                }
+            }
+        }
+
+        private void FetchNextToken()
+        {
+            // Check if we just started scanning.  Fetch STREAM-START then.
+
+            if (!streamStartProduced)
+            {
+                FetchStreamStart();
+                return;
+            }
+
+            // Eat whitespaces and comments until we reach the next token.
+
+            ScanToNextToken();
+
+            // Remove obsolete potential simple keys.
+
+            StaleSimpleKeys();
+
+            // Check the indentation level against the current column.
+
+            UnrollIndent(mark.Column);
+
+
+            // Ensure that the buffer contains at least 4 characters.  4 is the length
+            // of the longest indicators ('--- ' and '... ').
+
+
+            analyzer.Buffer.Cache(4);
+
+            // Is it the end of the stream?
+
+            if (analyzer.Buffer.EndOfInput)
+            {
+                FetchStreamEnd();
+                return;
+            }
+
+            // Is it a directive?
+
+            if (mark.Column == 0 && analyzer.Check('%'))
+            {
+                FetchDirective();
+                return;
+            }
+
+            // Is it the document start indicator?
+
+            bool isDocumentStart =
+                mark.Column == 0 &&
+                analyzer.Check('-', 0) &&
+                analyzer.Check('-', 1) &&
+                analyzer.Check('-', 2) &&
+                analyzer.IsBlankOrBreakOrZero(3);
+
+            if (isDocumentStart)
+            {
+                FetchDocumentIndicator(true);
+                return;
+            }
+
+            // Is it the document end indicator?
+
+            bool isDocumentEnd =
+                mark.Column == 0 &&
+                analyzer.Check('.', 0) &&
+                analyzer.Check('.', 1) &&
+                analyzer.Check('.', 2) &&
+                analyzer.IsBlankOrBreakOrZero(3);
+
+            if (isDocumentEnd)
+            {
+                FetchDocumentIndicator(false);
+                return;
+            }
+
+            // Is it the flow sequence start indicator?
+
+            if (analyzer.Check('['))
+            {
+                FetchFlowCollectionStart(true);
+                return;
+            }
+
+            // Is it the flow mapping start indicator?
+
+            if (analyzer.Check('{'))
+            {
+                FetchFlowCollectionStart(false);
+                return;
+            }
+
+            // Is it the flow sequence end indicator?
+
+            if (analyzer.Check(']'))
+            {
+                FetchFlowCollectionEnd(true);
+                return;
+            }
+
+            // Is it the flow mapping end indicator?
+
+            if (analyzer.Check('}'))
+            {
+                FetchFlowCollectionEnd(false);
+                return;
+            }
+
+            // Is it the flow entry indicator?
+
+            if (analyzer.Check(','))
+            {
+                FetchFlowEntry();
+                return;
+            }
+
+            // Is it the block entry indicator?
 
-			if (analyzer.Check('-') && analyzer.IsBlankOrBreakOrZero(1))
-			{
-				FetchBlockEntry();
-				return;
-			}
-
-			// Is it the key indicator?
-
-			if (analyzer.Check('?') && (flowLevel > 0 || analyzer.IsBlankOrBreakOrZero(1)))
-			{
-				FetchKey();
-				return;
-			}
-
-			// Is it the value indicator?
-
-			if (analyzer.Check(':') && (flowLevel > 0 || analyzer.IsBlankOrBreakOrZero(1)))
-			{
-				FetchValue();
-				return;
-			}
-
-			// Is it an alias?
-
-			if (analyzer.Check('*'))
-			{
-				FetchAnchor(true);
-				return;
-			}
-
-			// Is it an anchor?
-
-			if (analyzer.Check('&'))
-			{
-				FetchAnchor(false);
-				return;
-			}
-
-			// Is it a tag?
-
-			if (analyzer.Check('!'))
-			{
-				FetchTag();
-				return;
-			}
-
-			// Is it a literal scalar?
-
-			if (analyzer.Check('|') && flowLevel == 0)
-			{
-				FetchBlockScalar(true);
-				return;
-			}
-
-			// Is it a folded scalar?
-
-			if (analyzer.Check('>') && flowLevel == 0)
-			{
-				FetchBlockScalar(false);
-				return;
-			}
-
-			// Is it a single-quoted scalar?
-
-			if (analyzer.Check('\''))
-			{
-				FetchFlowScalar(true);
-				return;
-			}
-
-			// Is it a double-quoted scalar?
-
-			if (analyzer.Check('"'))
-			{
-				FetchFlowScalar(false);
-				return;
-			}
-
-
-			// Is it a plain scalar?
-
-			// A plain scalar may start with any non-blank characters except
-
-			//      '-', '?', ':', ',', '[', ']', '{', '}',
-			//      '#', '&', '*', '!', '|', '>', '\'', '\"',
-			//      '%', '@', '`'.
-
-			// In the block context (and, for the '-' indicator, in the flow context
-			// too), it may also start with the characters
-
-			//      '-', '?', ':'
-
-			// if it is followed by a non-space character.
-
-			// The last rule is more restrictive than the specification requires.
-
-
-			bool isInvalidPlainScalarCharacter = analyzer.IsBlankOrBreakOrZero() || analyzer.Check("-?:,[]{}#&*!|>'\"%@`");
-
-			bool isPlainScalar =
-				!isInvalidPlainScalarCharacter ||
-				(analyzer.Check('-') && !analyzer.IsBlank(1)) ||
-				(flowLevel == 0 && (analyzer.Check("?:")) && !analyzer.IsBlankOrBreakOrZero(1));
-
-			if (isPlainScalar)
-			{
-				FetchPlainScalar();
-				return;
-			}
-
-			// If we don't determine the token type so far, it is an error.
-			throw new SyntaxErrorException(mark, mark, "While scanning for the next token, find character that cannot start any token.");
-		}
-
-		private bool CheckWhiteSpace()
-		{
-			return analyzer.Check(' ') || ((flowLevel > 0 || !simpleKeyAllowed) && analyzer.Check('\t'));
-		}
-
-		private bool IsDocumentIndicator()
-		{
-			if (mark.Column == 0 && analyzer.IsBlankOrBreakOrZero(3))
-			{
-				bool isDocumentStart = analyzer.Check('-', 0) && analyzer.Check('-', 1) && analyzer.Check('-', 2);
-				bool isDocumentEnd = analyzer.Check('.', 0) && analyzer.Check('.', 1) && analyzer.Check('.', 2);
-
-				return isDocumentStart || isDocumentEnd;
-			}
-			else
-			{
-				return false;
-			}
-		}
-
-		private void Skip()
-		{
-			++mark.Index;
-			++mark.Column;
-			analyzer.Buffer.Skip(1);
-		}
-
-		private void SkipLine()
-		{
-			if (analyzer.IsCrLf())
-			{
-				mark.Index += 2;
-				mark.Column = 0;
-				++mark.Line;
-				analyzer.Buffer.Skip(2);
-			}
-			else if (analyzer.IsBreak())
-			{
-				++mark.Index;
-				mark.Column = 0;
-				++mark.Line;
-				analyzer.Buffer.Skip(1);
-			}
-			else if (!analyzer.IsZero())
-			{
-				throw new InvalidOperationException("Not at a break.");
-			}
-		}
-
-		private void ScanToNextToken()
-		{
-			// Until the next token is not find.
-
-			for (; ;)
-			{
-
-				// Eat whitespaces.
-
-				// Tabs are allowed:
-
-				//  - in the flow context;
-				//  - in the block context, but not at the beginning of the line or
-				//  after '-', '?', or ':' (complex value).
-
-
-				while (CheckWhiteSpace())
-				{
-					Skip();
-				}
-
-				// Eat a comment until a line break.
-
-				if (analyzer.Check('#'))
-				{
-					while (!analyzer.IsBreakOrZero())
-					{
-						Skip();
-					}
-				}
-
-				// If it is a line break, eat it.
-
-				if (analyzer.IsBreak())
-				{
-					SkipLine();
-
-					// In the block context, a new line may start a simple key.
-
-					if (flowLevel == 0)
-					{
-						simpleKeyAllowed = true;
-					}
-				}
-				else
-				{
-					// We have find a token.
+            if (analyzer.Check('-') && analyzer.IsBlankOrBreakOrZero(1))
+            {
+                FetchBlockEntry();
+                return;
+            }
+
+            // Is it the key indicator?
+
+            if (analyzer.Check('?') && (flowLevel > 0 || analyzer.IsBlankOrBreakOrZero(1)))
+            {
+                FetchKey();
+                return;
+            }
+
+            // Is it the value indicator?
+
+            if (analyzer.Check(':') && (flowLevel > 0 || analyzer.IsBlankOrBreakOrZero(1)))
+            {
+                FetchValue();
+                return;
+            }
+
+            // Is it an alias?
+
+            if (analyzer.Check('*'))
+            {
+                FetchAnchor(true);
+                return;
+            }
+
+            // Is it an anchor?
+
+            if (analyzer.Check('&'))
+            {
+                FetchAnchor(false);
+                return;
+            }
+
+            // Is it a tag?
+
+            if (analyzer.Check('!'))
+            {
+                FetchTag();
+                return;
+            }
+
+            // Is it a literal scalar?
+
+            if (analyzer.Check('|') && flowLevel == 0)
+            {
+                FetchBlockScalar(true);
+                return;
+            }
+
+            // Is it a folded scalar?
+
+            if (analyzer.Check('>') && flowLevel == 0)
+            {
+                FetchBlockScalar(false);
+                return;
+            }
+
+            // Is it a single-quoted scalar?
+
+            if (analyzer.Check('\''))
+            {
+                FetchFlowScalar(true);
+                return;
+            }
+
+            // Is it a double-quoted scalar?
+
+            if (analyzer.Check('"'))
+            {
+                FetchFlowScalar(false);
+                return;
+            }
+
+
+            // Is it a plain scalar?
+
+            // A plain scalar may start with any non-blank characters except
+
+            //      '-', '?', ':', ',', '[', ']', '{', '}',
+            //      '#', '&', '*', '!', '|', '>', '\'', '\"',
+            //      '%', '@', '`'.
+
+            // In the block context (and, for the '-' indicator, in the flow context
+            // too), it may also start with the characters
+
+            //      '-', '?', ':'
+
+            // if it is followed by a non-space character.
+
+            // The last rule is more restrictive than the specification requires.
+
+
+            bool isInvalidPlainScalarCharacter = analyzer.IsBlankOrBreakOrZero() || analyzer.Check("-?:,[]{}#&*!|>'\"%@`");
+
+            bool isPlainScalar =
+                !isInvalidPlainScalarCharacter ||
+                (analyzer.Check('-') && !analyzer.IsBlank(1)) ||
+                (flowLevel == 0 && (analyzer.Check("?:")) && !analyzer.IsBlankOrBreakOrZero(1));
+
+            if (isPlainScalar)
+            {
+                FetchPlainScalar();
+                return;
+            }
+
+            // If we don't determine the token type so far, it is an error.
+            throw new SyntaxErrorException(mark, mark, "While scanning for the next token, find character that cannot start any token.");
+        }
+
+        private bool CheckWhiteSpace()
+        {
+            return analyzer.Check(' ') || ((flowLevel > 0 || !simpleKeyAllowed) && analyzer.Check('\t'));
+        }
+
+        private bool IsDocumentIndicator()
+        {
+            if (mark.Column == 0 && analyzer.IsBlankOrBreakOrZero(3))
+            {
+                bool isDocumentStart = analyzer.Check('-', 0) && analyzer.Check('-', 1) && analyzer.Check('-', 2);
+                bool isDocumentEnd = analyzer.Check('.', 0) && analyzer.Check('.', 1) && analyzer.Check('.', 2);
+
+                return isDocumentStart || isDocumentEnd;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        private void Skip()
+        {
+            ++mark.Index;
+            ++mark.Column;
+            analyzer.Buffer.Skip(1);
+        }
+
+        private void SkipLine()
+        {
+            if (analyzer.IsCrLf())
+            {
+                mark.Index += 2;
+                mark.Column = 0;
+                ++mark.Line;
+                analyzer.Buffer.Skip(2);
+            }
+            else if (analyzer.IsBreak())
+            {
+                ++mark.Index;
+                mark.Column = 0;
+                ++mark.Line;
+                analyzer.Buffer.Skip(1);
+            }
+            else if (!analyzer.IsZero())
+            {
+                throw new InvalidOperationException("Not at a break.");
+            }
+        }
+
+        private void ScanToNextToken()
+        {
+            // Until the next token is not find.
+
+            for (; ;)
+            {
+
+                // Eat whitespaces.
+
+                // Tabs are allowed:
+
+                //  - in the flow context;
+                //  - in the block context, but not at the beginning of the line or
+                //  after '-', '?', or ':' (complex value).
+
+
+                while (CheckWhiteSpace())
+                {
+                    Skip();
+                }
+
+                // Eat a comment until a line break.
+
+                if (analyzer.Check('#'))
+                {
+                    while (!analyzer.IsBreakOrZero())
+                    {
+                        Skip();
+                    }
+                }
+
+                // If it is a line break, eat it.
+
+                if (analyzer.IsBreak())
+                {
+                    SkipLine();
+
+                    // In the block context, a new line may start a simple key.
+
+                    if (flowLevel == 0)
+                    {
+                        simpleKeyAllowed = true;
+                    }
+                }
+                else
+                {
+                    // We have find a token.
 
-					break;
-				}
-			}
-		}
+                    break;
+                }
+            }
+        }
 
-		private void FetchStreamStart()
-		{
-			// Initialize the simple key stack.
+        private void FetchStreamStart()
+        {
+            // Initialize the simple key stack.
 
-			simpleKeys.Push(new SimpleKey());
+            simpleKeys.Push(new SimpleKey());
 
-			// A simple key is allowed at the beginning of the stream.
+            // A simple key is allowed at the beginning of the stream.
 
-			simpleKeyAllowed = true;
-
-			// We have started.
+            simpleKeyAllowed = true;
+
+            // We have started.
 
-			streamStartProduced = true;
+            streamStartProduced = true;
 
-			// Create the STREAM-START token and append it to the queue.
+            // Create the STREAM-START token and append it to the queue.
 
-			tokens.Enqueue(new StreamStart(mark, mark));
-		}
+            tokens.Enqueue(new StreamStart(mark, mark));
+        }
 
-		/// <summary>
-		/// Pop indentation levels from the indents stack until the current level
-		/// becomes less or equal to the column.  For each intendation level, append
-		/// the BLOCK-END token.
-		/// </summary>
+        /// <summary>
+        /// Pop indentation levels from the indents stack until the current level
+        /// becomes less or equal to the column.  For each intendation level, append
+        /// the BLOCK-END token.
+        /// </summary>
 
-		private void UnrollIndent(int column)
-		{
-			// In the flow context, do nothing.
+        private void UnrollIndent(int column)
+        {
+            // In the flow context, do nothing.
 
-			if (flowLevel != 0)
-			{
-				return;
-			}
+            if (flowLevel != 0)
+            {
+                return;
+            }
 
-			// Loop through the intendation levels in the stack.
+            // Loop through the intendation levels in the stack.
 
-			while (indent > column)
-			{
-				// Create a token and append it to the queue.
+            while (indent > column)
+            {
+                // Create a token and append it to the queue.
 
-				tokens.Enqueue(new BlockEnd(mark, mark));
+                tokens.Enqueue(new BlockEnd(mark, mark));
 
-				// Pop the indentation level.
+                // Pop the indentation level.
 
-				indent = indents.Pop();
-			}
-		}
+                indent = indents.Pop();
+            }
+        }
 
-		/// <summary>
-		/// Produce the STREAM-END token and shut down the scanner.
-		/// </summary>
-		private void FetchStreamEnd()
-		{
-			// Force new line.
+        /// <summary>
+        /// Produce the STREAM-END token and shut down the scanner.
+        /// </summary>
+        private void FetchStreamEnd()
+        {
+            // Force new line.
 
-			if (mark.Column != 0)
-			{
-				mark.Column = 0;
-				++mark.Line;
-			}
+            if (mark.Column != 0)
+            {
+                mark.Column = 0;
+                ++mark.Line;
+            }
 
-			// Reset the indentation level.
+            // Reset the indentation level.
 
-			UnrollIndent(-1);
+            UnrollIndent(-1);
 
-			// Reset simple keys.
+            // Reset simple keys.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Create the STREAM-END token and append it to the queue.
+            // Create the STREAM-END token and append it to the queue.
 
-			streamEndProduced = true;
-			tokens.Enqueue(new StreamEnd(mark, mark));
-		}
+            streamEndProduced = true;
+            tokens.Enqueue(new StreamEnd(mark, mark));
+        }
 
-		private void FetchDirective()
-		{
-			// Reset the indentation level.
+        private void FetchDirective()
+        {
+            // Reset the indentation level.
 
-			UnrollIndent(-1);
+            UnrollIndent(-1);
 
-			// Reset simple keys.
+            // Reset simple keys.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Create the YAML-DIRECTIVE or TAG-DIRECTIVE token.
+            // Create the YAML-DIRECTIVE or TAG-DIRECTIVE token.
 
-			Token token = ScanDirective();
+            Token token = ScanDirective();
 
-			// Append the token to the queue.
+            // Append the token to the queue.
 
-			tokens.Enqueue(token);
-		}
+            tokens.Enqueue(token);
+        }
 
-		/// <summary>
-		/// Scan a YAML-DIRECTIVE or TAG-DIRECTIVE token.
-		///
-		/// Scope:
-		///      %YAML    1.1    # a comment \n
-		///      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-		///      %TAG    !yaml!  tag:yaml.org,2002:  \n
-		///      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-		/// </summary>
-		private Token ScanDirective()
-		{
-			// Eat '%'.
+        /// <summary>
+        /// Scan a YAML-DIRECTIVE or TAG-DIRECTIVE token.
+        ///
+        /// Scope:
+        ///      %YAML    1.1    # a comment \n
+        ///      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        ///      %TAG    !yaml!  tag:yaml.org,2002:  \n
+        ///      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        /// </summary>
+        private Token ScanDirective()
+        {
+            // Eat '%'.
 
-			Mark start = mark;
+            Mark start = mark;
 
-			Skip();
+            Skip();
 
-			// Scan the directive name.
+            // Scan the directive name.
 
-			string name = ScanDirectiveName(start);
+            string name = ScanDirectiveName(start);
 
-			// Is it a YAML directive?
+            // Is it a YAML directive?
 
-			Token directive;
-			switch (name)
-			{
-				case "YAML":
-					directive = ScanVersionDirectiveValue(start);
-					break;
+            Token directive;
+            switch (name)
+            {
+                case "YAML":
+                    directive = ScanVersionDirectiveValue(start);
+                    break;
 
-				case "TAG":
-					directive = ScanTagDirectiveValue(start);
-					break;
+                case "TAG":
+                    directive = ScanTagDirectiveValue(start);
+                    break;
 
-				default:
-					throw new SyntaxErrorException(start, mark, "While scanning a directive, find uknown directive name.");
-			}
+                default:
+                    throw new SyntaxErrorException(start, mark, "While scanning a directive, find uknown directive name.");
+            }
 
-			// Eat the rest of the line including any comments.
+            // Eat the rest of the line including any comments.
 
-			while (analyzer.IsBlank())
-			{
-				Skip();
-			}
+            while (analyzer.IsBlank())
+            {
+                Skip();
+            }
 
-			if (analyzer.Check('#'))
-			{
-				while (!analyzer.IsBreakOrZero())
-				{
-					Skip();
-				}
-			}
+            if (analyzer.Check('#'))
+            {
+                while (!analyzer.IsBreakOrZero())
+                {
+                    Skip();
+                }
+            }
 
-			// Check if we are at the end of the line.
+            // Check if we are at the end of the line.
 
-			if (!analyzer.IsBreakOrZero())
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a directive, did not find expected comment or line break.");
-			}
+            if (!analyzer.IsBreakOrZero())
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a directive, did not find expected comment or line break.");
+            }
 
-			// Eat a line break.
+            // Eat a line break.
 
-			if (analyzer.IsBreak())
-			{
-				SkipLine();
-			}
+            if (analyzer.IsBreak())
+            {
+                SkipLine();
+            }
 
-			return directive;
-		}
+            return directive;
+        }
 
-		/// <summary>
-		/// Produce the DOCUMENT-START or DOCUMENT-END token.
-		/// </summary>
+        /// <summary>
+        /// Produce the DOCUMENT-START or DOCUMENT-END token.
+        /// </summary>
 
-		private void FetchDocumentIndicator(bool isStartToken)
-		{
-			// Reset the indentation level.
+        private void FetchDocumentIndicator(bool isStartToken)
+        {
+            // Reset the indentation level.
 
-			UnrollIndent(-1);
+            UnrollIndent(-1);
 
-			// Reset simple keys.
+            // Reset simple keys.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
+            Mark start = mark;
 
-			Skip();
-			Skip();
-			Skip();
+            Skip();
+            Skip();
+            Skip();
 
-			Token token = isStartToken ? (Token)new DocumentStart(start, mark) : new DocumentEnd(start, start);
-			tokens.Enqueue(token);
-		}
+            Token token = isStartToken ? (Token)new DocumentStart(start, mark) : new DocumentEnd(start, start);
+            tokens.Enqueue(token);
+        }
 
-		/// <summary>
-		/// Produce the FLOW-SEQUENCE-START or FLOW-MAPPING-START token.
-		/// </summary>
+        /// <summary>
+        /// Produce the FLOW-SEQUENCE-START or FLOW-MAPPING-START token.
+        /// </summary>
 
-		private void FetchFlowCollectionStart(bool isSequenceToken)
-		{
-			// The indicators '[' and '{' may start a simple key.
+        private void FetchFlowCollectionStart(bool isSequenceToken)
+        {
+            // The indicators '[' and '{' may start a simple key.
 
-			SaveSimpleKey();
+            SaveSimpleKey();
 
-			// Increase the flow level.
+            // Increase the flow level.
 
-			IncreaseFlowLevel();
+            IncreaseFlowLevel();
 
-			// A simple key may follow the indicators '[' and '{'.
+            // A simple key may follow the indicators '[' and '{'.
 
-			simpleKeyAllowed = true;
+            simpleKeyAllowed = true;
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
-			Skip();
+            Mark start = mark;
+            Skip();
 
-			// Create the FLOW-SEQUENCE-START of FLOW-MAPPING-START token.
+            // Create the FLOW-SEQUENCE-START of FLOW-MAPPING-START token.
 
-			Token token;
-			if (isSequenceToken)
-			{
-				token = new FlowSequenceStart(start, start);
-			}
-			else
-			{
-				token = new FlowMappingStart(start, start);
-			}
+            Token token;
+            if (isSequenceToken)
+            {
+                token = new FlowSequenceStart(start, start);
+            }
+            else
+            {
+                token = new FlowMappingStart(start, start);
+            }
 
-			tokens.Enqueue(token);
-		}
+            tokens.Enqueue(token);
+        }
 
-		/// <summary>
-		/// Increase the flow level and resize the simple key list if needed.
-		/// </summary>
+        /// <summary>
+        /// Increase the flow level and resize the simple key list if needed.
+        /// </summary>
 
-		private void IncreaseFlowLevel()
-		{
-			// Reset the simple key on the next level.
+        private void IncreaseFlowLevel()
+        {
+            // Reset the simple key on the next level.
 
-			simpleKeys.Push(new SimpleKey());
+            simpleKeys.Push(new SimpleKey());
 
-			// Increase the flow level.
+            // Increase the flow level.
 
-			++flowLevel;
-		}
+            ++flowLevel;
+        }
 
-		/// <summary>
-		/// Produce the FLOW-SEQUENCE-END or FLOW-MAPPING-END token.
-		/// </summary>
+        /// <summary>
+        /// Produce the FLOW-SEQUENCE-END or FLOW-MAPPING-END token.
+        /// </summary>
 
-		private void FetchFlowCollectionEnd(bool isSequenceToken)
-		{
-			// Reset any potential simple key on the current flow level.
+        private void FetchFlowCollectionEnd(bool isSequenceToken)
+        {
+            // Reset any potential simple key on the current flow level.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			// Decrease the flow level.
+            // Decrease the flow level.
 
-			DecreaseFlowLevel();
+            DecreaseFlowLevel();
 
-			// No simple keys after the indicators ']' and '}'.
+            // No simple keys after the indicators ']' and '}'.
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
-			Skip();
+            Mark start = mark;
+            Skip();
 
-			Token token;
-			if (isSequenceToken)
-			{
-				token = new FlowSequenceEnd(start, start);
-			}
-			else
-			{
-				token = new FlowMappingEnd(start, start);
-			}
+            Token token;
+            if (isSequenceToken)
+            {
+                token = new FlowSequenceEnd(start, start);
+            }
+            else
+            {
+                token = new FlowMappingEnd(start, start);
+            }
 
-			tokens.Enqueue(token);
-		}
+            tokens.Enqueue(token);
+        }
 
-		/// <summary>
-		/// Decrease the flow level.
-		/// </summary>
+        /// <summary>
+        /// Decrease the flow level.
+        /// </summary>
 
-		private void DecreaseFlowLevel()
-		{
-			Debug.Assert(flowLevel > 0, "Could flowLevel be zero when this method is called?");
-			if (flowLevel > 0)
-			{
-				--flowLevel;
-				simpleKeys.Pop();
-			}
-		}
+        private void DecreaseFlowLevel()
+        {
+            Debug.Assert(flowLevel > 0, "Could flowLevel be zero when this method is called?");
+            if (flowLevel > 0)
+            {
+                --flowLevel;
+                simpleKeys.Pop();
+            }
+        }
 
-		/// <summary>
-		/// Produce the FLOW-ENTRY token.
-		/// </summary>
+        /// <summary>
+        /// Produce the FLOW-ENTRY token.
+        /// </summary>
 
-		private void FetchFlowEntry()
-		{
-			// Reset any potential simple keys on the current flow level.
+        private void FetchFlowEntry()
+        {
+            // Reset any potential simple keys on the current flow level.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			// Simple keys are allowed after ','.
+            // Simple keys are allowed after ','.
 
-			simpleKeyAllowed = true;
+            simpleKeyAllowed = true;
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
-			Skip();
+            Mark start = mark;
+            Skip();
 
-			// Create the FLOW-ENTRY token and append it to the queue.
+            // Create the FLOW-ENTRY token and append it to the queue.
 
-			tokens.Enqueue(new FlowEntry(start, mark));
-		}
+            tokens.Enqueue(new FlowEntry(start, mark));
+        }
 
-		/// <summary>
-		/// Produce the BLOCK-ENTRY token.
-		/// </summary>
+        /// <summary>
+        /// Produce the BLOCK-ENTRY token.
+        /// </summary>
 
-		private void FetchBlockEntry()
-		{
-			// Check if the scanner is in the block context.
+        private void FetchBlockEntry()
+        {
+            // Check if the scanner is in the block context.
 
-			if (flowLevel == 0)
-			{
-				// Check if we are allowed to start a new entry.
+            if (flowLevel == 0)
+            {
+                // Check if we are allowed to start a new entry.
 
-				if (!simpleKeyAllowed)
-				{
-					throw new SyntaxErrorException(mark, mark, "Block sequence entries are not allowed in this context.");
-				}
+                if (!simpleKeyAllowed)
+                {
+                    throw new SyntaxErrorException(mark, mark, "Block sequence entries are not allowed in this context.");
+                }
 
-				// Add the BLOCK-SEQUENCE-START token if needed.
-				RollIndent(mark.Column, -1, true, mark);
-			}
-			else
-			{
+                // Add the BLOCK-SEQUENCE-START token if needed.
+                RollIndent(mark.Column, -1, true, mark);
+            }
+            else
+            {
 
-				// It is an error for the '-' indicator to occur in the flow context,
-				// but we let the Parser detect and report about it because the Parser
-				// is able to point to the context.
+                // It is an error for the '-' indicator to occur in the flow context,
+                // but we let the Parser detect and report about it because the Parser
+                // is able to point to the context.
 
-			}
+            }
 
-			// Reset any potential simple keys on the current flow level.
+            // Reset any potential simple keys on the current flow level.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			// Simple keys are allowed after '-'.
+            // Simple keys are allowed after '-'.
 
-			simpleKeyAllowed = true;
+            simpleKeyAllowed = true;
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
-			Skip();
+            Mark start = mark;
+            Skip();
 
-			// Create the BLOCK-ENTRY token and append it to the queue.
+            // Create the BLOCK-ENTRY token and append it to the queue.
 
-			tokens.Enqueue(new BlockEntry(start, mark));
-		}
+            tokens.Enqueue(new BlockEntry(start, mark));
+        }
 
-		/// <summary>
-		/// Produce the KEY token.
-		/// </summary>
+        /// <summary>
+        /// Produce the KEY token.
+        /// </summary>
 
-		private void FetchKey()
-		{
-			// In the block context, additional checks are required.
+        private void FetchKey()
+        {
+            // In the block context, additional checks are required.
 
-			if (flowLevel == 0)
-			{
-				// Check if we are allowed to start a new key (not nessesary simple).
+            if (flowLevel == 0)
+            {
+                // Check if we are allowed to start a new key (not nessesary simple).
 
-				if (!simpleKeyAllowed)
-				{
-					throw new SyntaxErrorException(mark, mark, "Mapping keys are not allowed in this context.");
-				}
+                if (!simpleKeyAllowed)
+                {
+                    throw new SyntaxErrorException(mark, mark, "Mapping keys are not allowed in this context.");
+                }
 
-				// Add the BLOCK-MAPPING-START token if needed.
+                // Add the BLOCK-MAPPING-START token if needed.
 
-				RollIndent(mark.Column, -1, false, mark);
-			}
+                RollIndent(mark.Column, -1, false, mark);
+            }
 
-			// Reset any potential simple keys on the current flow level.
+            // Reset any potential simple keys on the current flow level.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			// Simple keys are allowed after '?' in the block context.
+            // Simple keys are allowed after '?' in the block context.
 
-			simpleKeyAllowed = flowLevel == 0;
+            simpleKeyAllowed = flowLevel == 0;
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
-			Skip();
+            Mark start = mark;
+            Skip();
 
-			// Create the KEY token and append it to the queue.
+            // Create the KEY token and append it to the queue.
 
-			tokens.Enqueue(new Key(start, mark));
-		}
+            tokens.Enqueue(new Key(start, mark));
+        }
 
-		/// <summary>
-		/// Produce the VALUE token.
-		/// </summary>
+        /// <summary>
+        /// Produce the VALUE token.
+        /// </summary>
 
-		private void FetchValue()
-		{
-			SimpleKey simpleKey = simpleKeys.Peek();
+        private void FetchValue()
+        {
+            SimpleKey simpleKey = simpleKeys.Peek();
 
-			// Have we find a simple key?
+            // Have we find a simple key?
 
-			if (simpleKey.IsPossible)
-			{
-				// Create the KEY token and insert it into the queue.
+            if (simpleKey.IsPossible)
+            {
+                // Create the KEY token and insert it into the queue.
 
-				tokens.Insert(simpleKey.TokenNumber - tokensParsed, new Key(simpleKey.Mark, simpleKey.Mark));
+                tokens.Insert(simpleKey.TokenNumber - tokensParsed, new Key(simpleKey.Mark, simpleKey.Mark));
 
-				// In the block context, we may need to add the BLOCK-MAPPING-START token.
+                // In the block context, we may need to add the BLOCK-MAPPING-START token.
 
-				RollIndent(simpleKey.Mark.Column, simpleKey.TokenNumber, false, simpleKey.Mark);
+                RollIndent(simpleKey.Mark.Column, simpleKey.TokenNumber, false, simpleKey.Mark);
 
-				// Remove the simple key.
+                // Remove the simple key.
 
-				simpleKey.IsPossible = false;
+                simpleKey.IsPossible = false;
 
-				// A simple key cannot follow another simple key.
+                // A simple key cannot follow another simple key.
 
-				simpleKeyAllowed = false;
-			}
-			else
-			{
-				// The ':' indicator follows a complex key.
+                simpleKeyAllowed = false;
+            }
+            else
+            {
+                // The ':' indicator follows a complex key.
 
-				// In the block context, extra checks are required.
+                // In the block context, extra checks are required.
 
-				if (flowLevel == 0)
-				{
-					// Check if we are allowed to start a complex value.
+                if (flowLevel == 0)
+                {
+                    // Check if we are allowed to start a complex value.
 
-					if (!simpleKeyAllowed)
-					{
-						throw new SyntaxErrorException(mark, mark, "Mapping values are not allowed in this context.");
-					}
+                    if (!simpleKeyAllowed)
+                    {
+                        throw new SyntaxErrorException(mark, mark, "Mapping values are not allowed in this context.");
+                    }
 
-					// Add the BLOCK-MAPPING-START token if needed.
+                    // Add the BLOCK-MAPPING-START token if needed.
 
-					RollIndent(mark.Column, -1, false, mark);
-				}
+                    RollIndent(mark.Column, -1, false, mark);
+                }
 
-				// Simple keys after ':' are allowed in the block context.
+                // Simple keys after ':' are allowed in the block context.
 
-				simpleKeyAllowed = flowLevel == 0;
-			}
+                simpleKeyAllowed = flowLevel == 0;
+            }
 
-			// Consume the token.
+            // Consume the token.
 
-			Mark start = mark;
-			Skip();
+            Mark start = mark;
+            Skip();
 
-			// Create the VALUE token and append it to the queue.
+            // Create the VALUE token and append it to the queue.
 
-			tokens.Enqueue(new Value(start, mark));
-		}
+            tokens.Enqueue(new Value(start, mark));
+        }
 
-		/// <summary>
-		/// Push the current indentation level to the stack and set the new level
-		/// the current column is greater than the indentation level.  In this case,
-		/// append or insert the specified token into the token queue.
-		/// </summary>
-		private void RollIndent(int column, int number, bool isSequence, Mark position)
-		{
-			// In the flow context, do nothing.
+        /// <summary>
+        /// Push the current indentation level to the stack and set the new level
+        /// the current column is greater than the indentation level.  In this case,
+        /// append or insert the specified token into the token queue.
+        /// </summary>
+        private void RollIndent(int column, int number, bool isSequence, Mark position)
+        {
+            // In the flow context, do nothing.
 
-			if (flowLevel > 0)
-			{
-				return;
-			}
+            if (flowLevel > 0)
+            {
+                return;
+            }
 
-			if (indent < column)
-			{
+            if (indent < column)
+            {
 
-				// Push the current indentation level to the stack and set the new
-				// indentation level.
+                // Push the current indentation level to the stack and set the new
+                // indentation level.
 
 
-				indents.Push(indent);
+                indents.Push(indent);
 
-				indent = column;
+                indent = column;
 
-				// Create a token and insert it into the queue.
+                // Create a token and insert it into the queue.
 
-				Token token;
-				if (isSequence)
-				{
-					token = new BlockSequenceStart(position, position);
-				}
-				else
-				{
-					token = new BlockMappingStart(position, position);
-				}
+                Token token;
+                if (isSequence)
+                {
+                    token = new BlockSequenceStart(position, position);
+                }
+                else
+                {
+                    token = new BlockMappingStart(position, position);
+                }
 
-				if (number == -1)
-				{
-					tokens.Enqueue(token);
-				}
-				else
-				{
-					tokens.Insert(number - tokensParsed, token);
-				}
-			}
-		}
+                if (number == -1)
+                {
+                    tokens.Enqueue(token);
+                }
+                else
+                {
+                    tokens.Insert(number - tokensParsed, token);
+                }
+            }
+        }
 
-		/// <summary>
-		/// Produce the ALIAS or ANCHOR token.
-		/// </summary>
+        /// <summary>
+        /// Produce the ALIAS or ANCHOR token.
+        /// </summary>
 
-		private void FetchAnchor(bool isAlias)
-		{
-			// An anchor or an alias could be a simple key.
+        private void FetchAnchor(bool isAlias)
+        {
+            // An anchor or an alias could be a simple key.
 
-			SaveSimpleKey();
+            SaveSimpleKey();
 
-			// A simple key cannot follow an anchor or an alias.
+            // A simple key cannot follow an anchor or an alias.
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Create the ALIAS or ANCHOR token and append it to the queue.
+            // Create the ALIAS or ANCHOR token and append it to the queue.
 
-			tokens.Enqueue(ScanAnchor(isAlias));
-		}
+            tokens.Enqueue(ScanAnchor(isAlias));
+        }
 
-		private Token ScanAnchor(bool isAlias)
-		{
-			// Eat the indicator character.
+        private Token ScanAnchor(bool isAlias)
+        {
+            // Eat the indicator character.
 
-			Mark start = mark;
+            Mark start = mark;
 
-			Skip();
+            Skip();
 
-			// Consume the value.
+            // Consume the value.
 
-			StringBuilder value = new StringBuilder();
-			while (analyzer.IsAlpha())
-			{
-				value.Append(ReadCurrentCharacter());
-			}
+            StringBuilder value = new StringBuilder();
+            while (analyzer.IsAlpha())
+            {
+                value.Append(ReadCurrentCharacter());
+            }
 
 
-			// Check if length of the anchor is greater than 0 and it is followed by
-			// a whitespace character or one of the indicators:
+            // Check if length of the anchor is greater than 0 and it is followed by
+            // a whitespace character or one of the indicators:
 
-			//      '?', ':', ',', ']', '}', '%', '@', '`'.
+            //      '?', ':', ',', ']', '}', '%', '@', '`'.
 
 
-			if (value.Length == 0 || !(analyzer.IsBlankOrBreakOrZero() || analyzer.Check("?:,]}%@`")))
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning an anchor or alias, did not find expected alphabetic or numeric character.");
-			}
+            if (value.Length == 0 || !(analyzer.IsBlankOrBreakOrZero() || analyzer.Check("?:,]}%@`")))
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning an anchor or alias, did not find expected alphabetic or numeric character.");
+            }
 
-			// Create a token.
+            // Create a token.
 
-			if (isAlias)
-			{
-				return new AnchorAlias(value.ToString(), start, mark);
-			}
-			else
-			{
-				return new Anchor(value.ToString(), start, mark);
-			}
-		}
+            if (isAlias)
+            {
+                return new AnchorAlias(value.ToString(), start, mark);
+            }
+            else
+            {
+                return new Anchor(value.ToString(), start, mark);
+            }
+        }
 
-		/// <summary>
-		/// Produce the TAG token.
-		/// </summary>
+        /// <summary>
+        /// Produce the TAG token.
+        /// </summary>
 
-		private void FetchTag()
-		{
-			// A tag could be a simple key.
+        private void FetchTag()
+        {
+            // A tag could be a simple key.
 
-			SaveSimpleKey();
+            SaveSimpleKey();
 
-			// A simple key cannot follow a tag.
+            // A simple key cannot follow a tag.
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Create the TAG token and append it to the queue.
+            // Create the TAG token and append it to the queue.
 
-			tokens.Enqueue(ScanTag());
-		}
+            tokens.Enqueue(ScanTag());
+        }
 
-		/// <summary>
-		/// Scan a TAG token.
-		/// </summary>
+        /// <summary>
+        /// Scan a TAG token.
+        /// </summary>
 
-		Token ScanTag()
-		{
-			Mark start = mark;
+        Token ScanTag()
+        {
+            Mark start = mark;
 
-			// Check if the tag is in the canonical form.
+            // Check if the tag is in the canonical form.
 
-			string handle;
-			string suffix;
+            string handle;
+            string suffix;
 
-			if (analyzer.Check('<', 1))
-			{
-				// Set the handle to ''
+            if (analyzer.Check('<', 1))
+            {
+                // Set the handle to ''
 
-				handle = string.Empty;
+                handle = string.Empty;
 
-				// Eat '!<'
+                // Eat '!<'
 
-				Skip();
-				Skip();
+                Skip();
+                Skip();
 
-				// Consume the tag value.
+                // Consume the tag value.
 
-				suffix = ScanTagUri(null, start);
+                suffix = ScanTagUri(null, start);
 
-				// Check for '>' and eat it.
+                // Check for '>' and eat it.
 
-				if (!analyzer.Check('>'))
-				{
-					throw new SyntaxErrorException(start, mark, "While scanning a tag, did not find the expected '>'.");
-				}
+                if (!analyzer.Check('>'))
+                {
+                    throw new SyntaxErrorException(start, mark, "While scanning a tag, did not find the expected '>'.");
+                }
 
-				Skip();
-			}
-			else
-			{
-				// The tag has either the '!suffix' or the '!handle!suffix' form.
+                Skip();
+            }
+            else
+            {
+                // The tag has either the '!suffix' or the '!handle!suffix' form.
 
-				// First, try to scan a handle.
+                // First, try to scan a handle.
 
-				string firstPart = ScanTagHandle(false, start);
+                string firstPart = ScanTagHandle(false, start);
 
-				// Check if it is, indeed, handle.
+                // Check if it is, indeed, handle.
 
-				if (firstPart.Length > 1 && firstPart[0] == '!' && firstPart[firstPart.Length - 1] == '!')
-				{
-					handle = firstPart;
+                if (firstPart.Length > 1 && firstPart[0] == '!' && firstPart[firstPart.Length - 1] == '!')
+                {
+                    handle = firstPart;
 
-					// Scan the suffix now.
+                    // Scan the suffix now.
 
-					suffix = ScanTagUri(null, start);
-				}
-				else
-				{
-					// It wasn't a handle after all.  Scan the rest of the tag.
+                    suffix = ScanTagUri(null, start);
+                }
+                else
+                {
+                    // It wasn't a handle after all.  Scan the rest of the tag.
 
-					suffix = ScanTagUri(firstPart, start);
+                    suffix = ScanTagUri(firstPart, start);
 
-					// Set the handle to '!'.
+                    // Set the handle to '!'.
 
-					handle = "!";
+                    handle = "!";
 
 
-					// A special case: the '!' tag.  Set the handle to '' and the
-					// suffix to '!'.
+                    // A special case: the '!' tag.  Set the handle to '' and the
+                    // suffix to '!'.
 
 
-					if (suffix.Length == 0)
-					{
-						suffix = handle;
-						handle = string.Empty;
-					}
-				}
-			}
+                    if (suffix.Length == 0)
+                    {
+                        suffix = handle;
+                        handle = string.Empty;
+                    }
+                }
+            }
 
-			// Check the character which ends the tag.
+            // Check the character which ends the tag.
 
-			if (!analyzer.IsBlankOrBreakOrZero())
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a tag, did not find expected whitespace or line break.");
-			}
+            if (!analyzer.IsBlankOrBreakOrZero())
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a tag, did not find expected whitespace or line break.");
+            }
 
-			// Create a token.
+            // Create a token.
 
-			return new Tag(handle, suffix, start, mark);
-		}
+            return new Tag(handle, suffix, start, mark);
+        }
 
-		/// <summary>
-		/// Produce the SCALAR(...,literal) or SCALAR(...,folded) tokens.
-		/// </summary>
+        /// <summary>
+        /// Produce the SCALAR(...,literal) or SCALAR(...,folded) tokens.
+        /// </summary>
 
-		private void FetchBlockScalar(bool isLiteral)
-		{
-			// Remove any potential simple keys.
+        private void FetchBlockScalar(bool isLiteral)
+        {
+            // Remove any potential simple keys.
 
-			RemoveSimpleKey();
+            RemoveSimpleKey();
 
-			// A simple key may follow a block scalar.
+            // A simple key may follow a block scalar.
 
-			simpleKeyAllowed = true;
+            simpleKeyAllowed = true;
 
-			// Create the SCALAR token and append it to the queue.
+            // Create the SCALAR token and append it to the queue.
 
-			tokens.Enqueue(ScanBlockScalar(isLiteral));
-		}
+            tokens.Enqueue(ScanBlockScalar(isLiteral));
+        }
 
-		/// <summary>
-		/// Scan a block scalar.
-		/// </summary>
+        /// <summary>
+        /// Scan a block scalar.
+        /// </summary>
 
-		Token ScanBlockScalar(bool isLiteral)
-		{
-			StringBuilder value = new StringBuilder();
-			StringBuilder leadingBreak = new StringBuilder();
-			StringBuilder trailingBreaks = new StringBuilder();
+        Token ScanBlockScalar(bool isLiteral)
+        {
+            StringBuilder value = new StringBuilder();
+            StringBuilder leadingBreak = new StringBuilder();
+            StringBuilder trailingBreaks = new StringBuilder();
 
-			int chomping = 0;
-			int increment = 0;
-			int currentIndent = 0;
-			bool leadingBlank = false;
+            int chomping = 0;
+            int increment = 0;
+            int currentIndent = 0;
+            bool leadingBlank = false;
 
-			// Eat the indicator '|' or '>'.
+            // Eat the indicator '|' or '>'.
 
-			Mark start = mark;
+            Mark start = mark;
 
-			Skip();
+            Skip();
 
-			// Check for a chomping indicator.
+            // Check for a chomping indicator.
 
-			if (analyzer.Check("+-"))
-			{
-				// Set the chomping method and eat the indicator.
+            if (analyzer.Check("+-"))
+            {
+                // Set the chomping method and eat the indicator.
 
-				chomping = analyzer.Check('+') ? + 1 : -1;
+                chomping = analyzer.Check('+') ? + 1 : -1;
 
-				Skip();
+                Skip();
 
-				// Check for an indentation indicator.
+                // Check for an indentation indicator.
 
-				if (analyzer.IsDigit())
-				{
-					// Check that the intendation is greater than 0.
+                if (analyzer.IsDigit())
+                {
+                    // Check that the intendation is greater than 0.
 
-					if (analyzer.Check('0'))
-					{
-						throw new SyntaxErrorException(start, mark, "While scanning a block scalar, find an intendation indicator equal to 0.");
-					}
+                    if (analyzer.Check('0'))
+                    {
+                        throw new SyntaxErrorException(start, mark, "While scanning a block scalar, find an intendation indicator equal to 0.");
+                    }
 
-					// Get the intendation level and eat the indicator.
+                    // Get the intendation level and eat the indicator.
 
-					increment = analyzer.AsDigit();
+                    increment = analyzer.AsDigit();
 
-					Skip();
-				}
-			}
+                    Skip();
+                }
+            }
 
-			// Do the same as above, but in the opposite order.
+            // Do the same as above, but in the opposite order.
 
-			else if (analyzer.IsDigit())
-			{
-				if (analyzer.Check('0'))
-				{
-					throw new SyntaxErrorException(start, mark, "While scanning a block scalar, find an intendation indicator equal to 0.");
-				}
+            else if (analyzer.IsDigit())
+            {
+                if (analyzer.Check('0'))
+                {
+                    throw new SyntaxErrorException(start, mark, "While scanning a block scalar, find an intendation indicator equal to 0.");
+                }
 
-				increment = analyzer.AsDigit();
+                increment = analyzer.AsDigit();
 
-				Skip();
+                Skip();
 
-				if (analyzer.Check("+-"))
-				{
-					chomping = analyzer.Check('+') ? + 1 : -1;
+                if (analyzer.Check("+-"))
+                {
+                    chomping = analyzer.Check('+') ? + 1 : -1;
 
-					Skip();
-				}
-			}
+                    Skip();
+                }
+            }
 
-			// Eat whitespaces and comments to the end of the line.
+            // Eat whitespaces and comments to the end of the line.
 
-			while (analyzer.IsBlank())
-			{
-				Skip();
-			}
+            while (analyzer.IsBlank())
+            {
+                Skip();
+            }
 
-			if (analyzer.Check('#'))
-			{
-				while (!analyzer.IsBreakOrZero())
-				{
-					Skip();
-				}
-			}
+            if (analyzer.Check('#'))
+            {
+                while (!analyzer.IsBreakOrZero())
+                {
+                    Skip();
+                }
+            }
 
-			// Check if we are at the end of the line.
+            // Check if we are at the end of the line.
 
-			if (!analyzer.IsBreakOrZero())
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a block scalar, did not find expected comment or line break.");
-			}
+            if (!analyzer.IsBreakOrZero())
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a block scalar, did not find expected comment or line break.");
+            }
 
-			// Eat a line break.
+            // Eat a line break.
 
-			if (analyzer.IsBreak())
-			{
-				SkipLine();
-			}
+            if (analyzer.IsBreak())
+            {
+                SkipLine();
+            }
 
-			Mark end = mark;
+            Mark end = mark;
 
-			// Set the intendation level if it was specified.
+            // Set the intendation level if it was specified.
 
-			if (increment != 0)
-			{
-				currentIndent = indent >= 0 ? indent + increment : increment;
-			}
+            if (increment != 0)
+            {
+                currentIndent = indent >= 0 ? indent + increment : increment;
+            }
 
-			// Scan the leading line breaks and determine the indentation level if needed.
+            // Scan the leading line breaks and determine the indentation level if needed.
 
-			currentIndent = ScanBlockScalarBreaks(currentIndent, trailingBreaks, start, ref end);
+            currentIndent = ScanBlockScalarBreaks(currentIndent, trailingBreaks, start, ref end);
 
-			// Scan the block scalar content.
+            // Scan the block scalar content.
 
-			while (mark.Column == currentIndent && !analyzer.IsZero())
-			{
+            while (mark.Column == currentIndent && !analyzer.IsZero())
+            {
 
-				// We are at the beginning of a non-empty line.
+                // We are at the beginning of a non-empty line.
 
 
-				// Is it a trailing whitespace?
+                // Is it a trailing whitespace?
 
-				bool trailingBlank = analyzer.IsBlank();
+                bool trailingBlank = analyzer.IsBlank();
 
-				// Check if we need to fold the leading line break.
+                // Check if we need to fold the leading line break.
 
-				if (!isLiteral && StartsWith(leadingBreak, '\n') && !leadingBlank && !trailingBlank)
-				{
-					// Do we need to join the lines by space?
+                if (!isLiteral && StartsWith(leadingBreak, '\n') && !leadingBlank && !trailingBlank)
+                {
+                    // Do we need to join the lines by space?
 
-					if (trailingBreaks.Length == 0)
-					{
-						value.Append(' ');
-					}
+                    if (trailingBreaks.Length == 0)
+                    {
+                        value.Append(' ');
+                    }
 
-					leadingBreak.Length = 0;
-				}
-				else
-				{
-					value.Append(leadingBreak.ToString());
-					leadingBreak.Length = 0;
-				}
+                    leadingBreak.Length = 0;
+                }
+                else
+                {
+                    value.Append(leadingBreak.ToString());
+                    leadingBreak.Length = 0;
+                }
 
-				// Append the remaining line breaks.
+                // Append the remaining line breaks.
 
-				value.Append(trailingBreaks.ToString());
-				trailingBreaks.Length = 0;
+                value.Append(trailingBreaks.ToString());
+                trailingBreaks.Length = 0;
 
-				// Is it a leading whitespace?
+                // Is it a leading whitespace?
 
-				leadingBlank = analyzer.IsBlank();
+                leadingBlank = analyzer.IsBlank();
 
-				// Consume the current line.
+                // Consume the current line.
 
-				while (!analyzer.IsBreakOrZero())
-				{
-					value.Append(ReadCurrentCharacter());
-				}
+                while (!analyzer.IsBreakOrZero())
+                {
+                    value.Append(ReadCurrentCharacter());
+                }
 
-				// Consume the line break.
+                // Consume the line break.
 
-				leadingBreak.Append(ReadLine());
+                leadingBreak.Append(ReadLine());
 
-				// Eat the following intendation spaces and line breaks.
+                // Eat the following intendation spaces and line breaks.
 
-				currentIndent = ScanBlockScalarBreaks(currentIndent, trailingBreaks, start, ref end);
-			}
+                currentIndent = ScanBlockScalarBreaks(currentIndent, trailingBreaks, start, ref end);
+            }
 
-			// Chomp the tail.
+            // Chomp the tail.
 
-			if (chomping != -1)
-			{
-				value.Append(leadingBreak);
-			}
-			if (chomping == 1)
-			{
-				value.Append(trailingBreaks);
-			}
+            if (chomping != -1)
+            {
+                value.Append(leadingBreak);
+            }
+            if (chomping == 1)
+            {
+                value.Append(trailingBreaks);
+            }
 
-			// Create a token.
+            // Create a token.
 
-			ScalarStyle style = isLiteral ? ScalarStyle.Literal : ScalarStyle.Folded;
-			return new Scalar(value.ToString(), style, start, end);
-		}
+            ScalarStyle style = isLiteral ? ScalarStyle.Literal : ScalarStyle.Folded;
+            return new Scalar(value.ToString(), style, start, end);
+        }
 
-		/// <summary>
-		/// Scan intendation spaces and line breaks for a block scalar.  Determine the
-		/// intendation level if needed.
-		/// </summary>
+        /// <summary>
+        /// Scan intendation spaces and line breaks for a block scalar.  Determine the
+        /// intendation level if needed.
+        /// </summary>
 
-		private int ScanBlockScalarBreaks(int currentIndent, StringBuilder breaks, Mark start, ref Mark end)
-		{
-			int maxIndent = 0;
+        private int ScanBlockScalarBreaks(int currentIndent, StringBuilder breaks, Mark start, ref Mark end)
+        {
+            int maxIndent = 0;
 
-			end = mark;
+            end = mark;
 
-			// Eat the intendation spaces and line breaks.
+            // Eat the intendation spaces and line breaks.
 
-			for (; ;)
-			{
-				// Eat the intendation spaces.
+            for (; ;)
+            {
+                // Eat the intendation spaces.
 
-				while ((currentIndent == 0 || mark.Column < currentIndent) && analyzer.IsSpace())
-				{
-					Skip();
-				}
+                while ((currentIndent == 0 || mark.Column < currentIndent) && analyzer.IsSpace())
+                {
+                    Skip();
+                }
 
-				if (mark.Column > maxIndent)
-				{
-					maxIndent = mark.Column;
-				}
+                if (mark.Column > maxIndent)
+                {
+                    maxIndent = mark.Column;
+                }
 
-				// Check for a tab character messing the intendation.
+                // Check for a tab character messing the intendation.
 
-				if ((currentIndent == 0 || mark.Column < currentIndent) && analyzer.IsTab())
-				{
-					throw new SyntaxErrorException(start, mark, "While scanning a block scalar, find a tab character where an intendation space is expected.");
-				}
+                if ((currentIndent == 0 || mark.Column < currentIndent) && analyzer.IsTab())
+                {
+                    throw new SyntaxErrorException(start, mark, "While scanning a block scalar, find a tab character where an intendation space is expected.");
+                }
 
-				// Have we find a non-empty line?
+                // Have we find a non-empty line?
 
-				if (!analyzer.IsBreak())
-				{
-					break;
-				}
+                if (!analyzer.IsBreak())
+                {
+                    break;
+                }
 
-				// Consume the line break.
+                // Consume the line break.
 
-				breaks.Append(ReadLine());
+                breaks.Append(ReadLine());
 
-				end = mark;
-			}
+                end = mark;
+            }
 
-			// Determine the indentation level if needed.
+            // Determine the indentation level if needed.
 
-			if (currentIndent == 0)
-			{
-				currentIndent = Math.Max(maxIndent, Math.Max(indent + 1, 1));
-			}
+            if (currentIndent == 0)
+            {
+                currentIndent = Math.Max(maxIndent, Math.Max(indent + 1, 1));
+            }
 
-			return currentIndent;
-		}
+            return currentIndent;
+        }
 
-		/// <summary>
-		/// Produce the SCALAR(...,single-quoted) or SCALAR(...,double-quoted) tokens.
-		/// </summary>
+        /// <summary>
+        /// Produce the SCALAR(...,single-quoted) or SCALAR(...,double-quoted) tokens.
+        /// </summary>
 
-		private void FetchFlowScalar(bool isSingleQuoted)
-		{
-			// A plain scalar could be a simple key.
+        private void FetchFlowScalar(bool isSingleQuoted)
+        {
+            // A plain scalar could be a simple key.
 
-			SaveSimpleKey();
+            SaveSimpleKey();
 
-			// A simple key cannot follow a flow scalar.
+            // A simple key cannot follow a flow scalar.
 
-			simpleKeyAllowed = false;
+            simpleKeyAllowed = false;
 
-			// Create the SCALAR token and append it to the queue.
+            // Create the SCALAR token and append it to the queue.
 
-			tokens.Enqueue(ScanFlowScalar(isSingleQuoted));
-		}
+            tokens.Enqueue(ScanFlowScalar(isSingleQuoted));
+        }
 
-		/// <summary>
-		/// Scan a quoted scalar.
-		/// </summary>
-		private Token ScanFlowScalar(bool isSingleQuoted)
-		{
-			// Eat the left quote.
+        /// <summary>
+        /// Scan a quoted scalar.
+        /// </summary>
+        private Token ScanFlowScalar(bool isSingleQuoted)
+        {
+            // Eat the left quote.
 
-			Mark start = mark;
-		    Mark end = mark;
+            Mark start = mark;
+            Mark end = mark;
 
-			Skip();
+            Skip();
 
-			// Consume the content of the quoted scalar.
-			scanScalarValue.Clear();
-			scanScalarWhitespaces.Clear();
-			scanScalarLeadingBreak.Clear();
-			scanScalarTrailingBreaks.Clear();
-			for (; ;)
-			{
-				// Check that there are no document indicators at the beginning of the line.
+            // Consume the content of the quoted scalar.
+            scanScalarValue.Clear();
+            scanScalarWhitespaces.Clear();
+            scanScalarLeadingBreak.Clear();
+            scanScalarTrailingBreaks.Clear();
 
-				if (IsDocumentIndicator())
-				{
-					throw new SyntaxErrorException(start, mark, "While scanning a quoted scalar, find unexpected document indicator.");
-				}
+            for (; ;)
+            {
+                // Check that there are no document indicators at the beginning of the line.
 
-				// Check for EOF.
+                if (IsDocumentIndicator())
+                {
+                    throw new SyntaxErrorException(start, mark, "While scanning a quoted scalar, find unexpected document indicator.");
+                }
 
-				if (analyzer.IsZero())
-				{
-					throw new SyntaxErrorException(start, mark, "While scanning a quoted scalar, find unexpected end of stream.");
-				}
+                // Check for EOF.
 
-				// Consume non-blank characters.
+                if (analyzer.IsZero())
+                {
+                    throw new SyntaxErrorException(start, mark, "While scanning a quoted scalar, find unexpected end of stream.");
+                }
 
-				bool hasLeadingBlanks = false;
+                // Consume non-blank characters.
 
-				while (!analyzer.IsBlankOrBreakOrZero())
-				{
-					// Check for an escaped single quote.
+                bool hasLeadingBlanks = false;
 
-					if (isSingleQuoted && analyzer.Check('\'', 0) && analyzer.Check('\'', 1))
-					{
-						scanScalarValue.Append('\'');
-						Skip();
-						Skip();
-					}
+                while (!analyzer.IsBlankOrBreakOrZero())
+                {
+                    // Check for an escaped single quote.
 
-					// Check for the right quote.
+                    if (isSingleQuoted && analyzer.Check('\'', 0) && analyzer.Check('\'', 1))
+                    {
+                        scanScalarValue.Append('\'');
+                        Skip();
+                        Skip();
+                    }
 
-					else if (analyzer.Check(isSingleQuoted ? '\'' : '"'))
-					{
-						break;
-					}
+                    // Check for the right quote.
 
-					// Check for an escaped line break.
+                    else if (analyzer.Check(isSingleQuoted ? '\'' : '"'))
+                    {
+                        break;
+                    }
 
-					else if (!isSingleQuoted && analyzer.Check('\\') && analyzer.IsBreak(1))
-					{
-						Skip();
-						SkipLine();
-						hasLeadingBlanks = true;
-						break;
-					}
+                    // Check for an escaped line break.
 
-					// Check for an escape sequence.
+                    else if (!isSingleQuoted && analyzer.Check('\\') && analyzer.IsBreak(1))
+                    {
+                        Skip();
+                        SkipLine();
+                        hasLeadingBlanks = true;
+                        break;
+                    }
 
-					else if (!isSingleQuoted && analyzer.Check('\\'))
-					{
-						int codeLength = 0;
+                    // Check for an escape sequence.
 
-						// Check the escape character.
+                    else if (!isSingleQuoted && analyzer.Check('\\'))
+                    {
+                        int codeLength = 0;
 
-						char escapeCharacter = analyzer.Peek(1);
-						switch (escapeCharacter)
-						{
-							case 'x':
-								codeLength = 2;
-								break;
+                        // Check the escape character.
 
-							case 'u':
-								codeLength = 4;
-								break;
+                        char escapeCharacter = analyzer.Peek(1);
+                        switch (escapeCharacter)
+                        {
+                            case 'x':
+                                codeLength = 2;
+                                break;
 
-							case 'U':
-								codeLength = 8;
-								break;
+                            case 'u':
+                                codeLength = 4;
+                                break;
 
-							default:
-								char unescapedCharacter;
-								if (simpleEscapeCodes.TryGetValue(escapeCharacter, out unescapedCharacter))
-								{
-									scanScalarValue.Append(unescapedCharacter);
-								}
-								else
-								{
-									throw new SyntaxErrorException(start, mark, "While parsing a quoted scalar, find unknown escape character.");
-								}
-								break;
-						}
+                            case 'U':
+                                codeLength = 8;
+                                break;
 
-						Skip();
-						Skip();
+                            default:
+                                char unescapedCharacter;
+                                if (simpleEscapeCodes.TryGetValue(escapeCharacter, out unescapedCharacter))
+                                {
+                                    scanScalarValue.Append(unescapedCharacter);
+                                }
+                                else
+                                {
+                                    throw new SyntaxErrorException(start, mark, "While parsing a quoted scalar, find unknown escape character.");
+                                }
+                                break;
+                        }
 
-						// Consume an arbitrary escape code.
+                        Skip();
+                        Skip();
 
-						if (codeLength > 0)
-						{
-							uint character = 0;
+                        // Consume an arbitrary escape code.
 
-							// Scan the character value.
+                        if (codeLength > 0)
+                        {
+                            uint character = 0;
 
-							for (int k = 0; k < codeLength; ++k)
-							{
-								if (!analyzer.IsHex(k))
-								{
-									throw new SyntaxErrorException(start, mark, "While parsing a quoted scalar, did not find expected hexdecimal number.");
-								}
-								character = (uint)((character << 4) + analyzer.AsHex(k));
-							}
+                            // Scan the character value.
 
-							// Check the value and write the character.
+                            for (int k = 0; k < codeLength; ++k)
+                            {
+                                if (!analyzer.IsHex(k))
+                                {
+                                    throw new SyntaxErrorException(start, mark, "While parsing a quoted scalar, did not find expected hexdecimal number.");
+                                }
+                                character = (uint)((character << 4) + analyzer.AsHex(k));
+                            }
 
-							if ((character >= 0xD800 && character <= 0xDFFF) || character > 0x10FFFF)
-							{
-								throw new SyntaxErrorException(start, mark, "While parsing a quoted scalar, find invalid Unicode character escape code.");
-							}
+                            // Check the value and write the character.
 
-							scanScalarValue.Append((char)character);
+                            if ((character >= 0xD800 && character <= 0xDFFF) || character > 0x10FFFF)
+                            {
+                                throw new SyntaxErrorException(start, mark, "While parsing a quoted scalar, find invalid Unicode character escape code.");
+                            }
 
-							// Advance the pointer.
+                            scanScalarValue.Append((char)character);
 
-							for (int k = 0; k < codeLength; ++k)
-							{
-								Skip();
-							}
-						}
-					}
-					else
-					{
-						// It is a non-escaped non-blank character.
+                            // Advance the pointer.
 
-						scanScalarValue.Append(ReadCurrentCharacter());
-					}
-				}
+                            for (int k = 0; k < codeLength; ++k)
+                            {
+                                Skip();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // It is a non-escaped non-blank character.
 
-				// Check if we are at the end of the scalar.
+                        scanScalarValue.Append(ReadCurrentCharacter());
+                    }
+                }
 
-				if (analyzer.Check(isSingleQuoted ? '\'' : '"'))
-					break;
+                // Check if we are at the end of the scalar.
 
-				// Consume blank characters.
+                if (analyzer.Check(isSingleQuoted ? '\'' : '"'))
+                    break;
 
-				while (analyzer.IsBlank() || analyzer.IsBreak())
-				{
-					if (analyzer.IsBlank())
-					{
-						// Consume a space or a tab character.
+                // Consume blank characters.
 
-						if (!hasLeadingBlanks)
-						{
-							scanScalarWhitespaces.Append(ReadCurrentCharacter());
-						}
-						else
-						{
-							Skip();
-						}
-					}
-					else
-					{
-						// Check if it is a first line break.
+                while (analyzer.IsBlank() || analyzer.IsBreak())
+                {
+                    if (analyzer.IsBlank())
+                    {
+                        // Consume a space or a tab character.
 
-						if (!hasLeadingBlanks)
-						{
-							scanScalarWhitespaces.Length = 0;
-							scanScalarLeadingBreak.Append(ReadLine());
-							hasLeadingBlanks = true;
-						}
-						else
-						{
-							scanScalarTrailingBreaks.Append(ReadLine());
-						}
-					}
-				}
+                        if (!hasLeadingBlanks)
+                        {
+                            scanScalarWhitespaces.Append(ReadCurrentCharacter());
+                        }
+                        else
+                        {
+                            Skip();
+                        }
+                    }
+                    else
+                    {
+                        // Check if it is a first line break.
 
-				// Join the whitespaces or fold line breaks.
+                        if (!hasLeadingBlanks)
+                        {
+                            scanScalarWhitespaces.Length = 0;
+                            scanScalarLeadingBreak.Append(ReadLine());
+                            hasLeadingBlanks = true;
+                        }
+                        else
+                        {
+                            scanScalarTrailingBreaks.Append(ReadLine());
+                        }
+                    }
+                }
 
-				if (hasLeadingBlanks)
-				{
-					// Do we need to fold line breaks?
+                // Join the whitespaces or fold line breaks.
 
-					if (StartsWith(scanScalarLeadingBreak, '\n'))
-					{
-						if (scanScalarTrailingBreaks.Length == 0)
-						{
-							scanScalarValue.Append(' ');
-						}
-						else
-						{
-							scanScalarValue.Append(scanScalarTrailingBreaks.ToString());
-						}
-					}
-					else
-					{
-						scanScalarValue.Append(scanScalarLeadingBreak.ToString());
-						scanScalarValue.Append(scanScalarTrailingBreaks.ToString());
-					}
-					scanScalarLeadingBreak.Length = 0;
-					scanScalarTrailingBreaks.Length = 0;
-				}
-				else
-				{
-					scanScalarValue.Append(scanScalarWhitespaces.ToString());
-					scanScalarWhitespaces.Length = 0;
-				}
-			}
+                if (hasLeadingBlanks)
+                {
+                    // Do we need to fold line breaks?
 
-			// Eat the right quote.
-			Skip();
+                    if (StartsWith(scanScalarLeadingBreak, '\n'))
+                    {
+                        if (scanScalarTrailingBreaks.Length == 0)
+                        {
+                            scanScalarValue.Append(' ');
+                        }
+                        else
+                        {
+                            scanScalarValue.Append(scanScalarTrailingBreaks.ToString());
+                        }
+                    }
+                    else
+                    {
+                        scanScalarValue.Append(scanScalarLeadingBreak.ToString());
+                        scanScalarValue.Append(scanScalarTrailingBreaks.ToString());
+                    }
+                    scanScalarLeadingBreak.Length = 0;
+                    scanScalarTrailingBreaks.Length = 0;
+                }
+                else
+                {
+                    scanScalarValue.Append(scanScalarWhitespaces.ToString());
+                    scanScalarWhitespaces.Length = 0;
+                }
+            }
 
-			end = mark;
-			return new Scalar(scanScalarValue.ToString(), isSingleQuoted ? ScalarStyle.SingleQuoted : ScalarStyle.DoubleQuoted, start, end);
-		}
+            // Eat the right quote.
+            Skip();
 
-		/// <summary>
-		/// Produce the SCALAR(...,plain) token.
-		/// </summary>
+            end = mark;
+            return new Scalar(scanScalarValue.ToString(), isSingleQuoted ? ScalarStyle.SingleQuoted : ScalarStyle.DoubleQuoted, start, end);
+        }
 
-		private void FetchPlainScalar()
-		{
-			// A plain scalar could be a simple key.
+        /// <summary>
+        /// Produce the SCALAR(...,plain) token.
+        /// </summary>
 
-			SaveSimpleKey();
+        private void FetchPlainScalar()
+        {
+            // A plain scalar could be a simple key.
 
-			// A simple key cannot follow a flow scalar.
+            SaveSimpleKey();
 
-			simpleKeyAllowed = false;
+            // A simple key cannot follow a flow scalar.
 
-			// Create the SCALAR token and append it to the queue.
+            simpleKeyAllowed = false;
 
-			tokens.Enqueue(ScanPlainScalar());
-		}
+            // Create the SCALAR token and append it to the queue.
 
-		/// <summary>
-		/// Scan a plain scalar.
-		/// </summary>
+            tokens.Enqueue(ScanPlainScalar());
+        }
 
-		private Token ScanPlainScalar()
-		{
-			StringBuilder value = new StringBuilder();
-			StringBuilder whitespaces = new StringBuilder();
-			StringBuilder leadingBreak = new StringBuilder();
-			StringBuilder trailingBreaks = new StringBuilder();
+        /// <summary>
+        /// Scan a plain scalar.
+        /// </summary>
 
-			bool hasLeadingBlanks = false;
-			int currentIndent = indent + 1;
+        private Token ScanPlainScalar()
+        {
+            StringBuilder value = new StringBuilder();
+            StringBuilder whitespaces = new StringBuilder();
+            StringBuilder leadingBreak = new StringBuilder();
+            StringBuilder trailingBreaks = new StringBuilder();
 
-			Mark start = mark;
-			Mark end = mark;
+            bool hasLeadingBlanks = false;
+            int currentIndent = indent + 1;
 
-			// Consume the content of the plain scalar.
+            Mark start = mark;
+            Mark end = mark;
 
-			for (; ;)
-			{
-				// Check for a document indicator.
+            // Consume the content of the plain scalar.
 
-				if (IsDocumentIndicator())
-				{
-					break;
-				}
+            for (; ;)
+            {
+                // Check for a document indicator.
 
-				// Check for a comment.
+                if (IsDocumentIndicator())
+                {
+                    break;
+                }
 
-				if (analyzer.Check('#'))
-				{
-					break;
-				}
+                // Check for a comment.
 
-				// Consume non-blank characters.
-				while (!analyzer.IsBlankOrBreakOrZero())
-				{
-					// Check for 'x:x' in the flow context. TODO: Fix the test "spec-08-13".
+                if (analyzer.Check('#'))
+                {
+                    break;
+                }
 
-					if (flowLevel > 0 && analyzer.Check(':') && !analyzer.IsBlankOrBreakOrZero(1))
-					{
-						throw new SyntaxErrorException(start, mark, "While scanning a plain scalar, find unexpected ':'.");
-					}
+                // Consume non-blank characters.
+                while (!analyzer.IsBlankOrBreakOrZero())
+                {
+                    // Check for 'x:x' in the flow context. TODO: Fix the test "spec-08-13".
 
-					// Check for indicators that may end a plain scalar.
+                    if (flowLevel > 0 && analyzer.Check(':') && !analyzer.IsBlankOrBreakOrZero(1))
+                    {
+                        throw new SyntaxErrorException(start, mark, "While scanning a plain scalar, find unexpected ':'.");
+                    }
 
-					if ((analyzer.Check(':') && analyzer.IsBlankOrBreakOrZero(1)) || (flowLevel > 0 && analyzer.Check(",:?[]{}")))
-					{
-						break;
-					}
+                    // Check for indicators that may end a plain scalar.
 
-					// Check if we need to join whitespaces and breaks.
+                    if ((analyzer.Check(':') && analyzer.IsBlankOrBreakOrZero(1)) || (flowLevel > 0 && analyzer.Check(",:?[]{}")))
+                    {
+                        break;
+                    }
 
-					if (hasLeadingBlanks || whitespaces.Length > 0)
-					{
-						if (hasLeadingBlanks)
-						{
-							// Do we need to fold line breaks?
+                    // Check if we need to join whitespaces and breaks.
 
-							if (StartsWith(leadingBreak, '\n'))
-							{
-								if (trailingBreaks.Length == 0)
-								{
-									value.Append(' ');
-								}
-								else
-								{
-									value.Append(trailingBreaks);
-								}
-							}
-							else
-							{
-								value.Append(leadingBreak);
-								value.Append(trailingBreaks);
-							}
+                    if (hasLeadingBlanks || whitespaces.Length > 0)
+                    {
+                        if (hasLeadingBlanks)
+                        {
+                            // Do we need to fold line breaks?
 
-							leadingBreak.Length = 0;
-							trailingBreaks.Length = 0;
+                            if (StartsWith(leadingBreak, '\n'))
+                            {
+                                if (trailingBreaks.Length == 0)
+                                {
+                                    value.Append(' ');
+                                }
+                                else
+                                {
+                                    value.Append(trailingBreaks);
+                                }
+                            }
+                            else
+                            {
+                                value.Append(leadingBreak);
+                                value.Append(trailingBreaks);
+                            }
 
-							hasLeadingBlanks = false;
-						}
-						else
-						{
-							value.Append(whitespaces);
-							whitespaces.Length = 0;
-						}
-					}
+                            leadingBreak.Length = 0;
+                            trailingBreaks.Length = 0;
 
-					// Copy the character.
+                            hasLeadingBlanks = false;
+                        }
+                        else
+                        {
+                            value.Append(whitespaces);
+                            whitespaces.Length = 0;
+                        }
+                    }
 
-					value.Append(ReadCurrentCharacter());
+                    // Copy the character.
 
-					end = mark;
-				}
+                    value.Append(ReadCurrentCharacter());
 
-				// Is it the end?
+                    end = mark;
+                }
 
-				if (!(analyzer.IsBlank() || analyzer.IsBreak()))
-				{
-					break;
-				}
+                // Is it the end?
 
-				// Consume blank characters.
+                if (!(analyzer.IsBlank() || analyzer.IsBreak()))
+                {
+                    break;
+                }
 
-				while (analyzer.IsBlank() || analyzer.IsBreak())
-				{
-					if (analyzer.IsBlank())
-					{
-						// Check for tab character that abuse intendation.
+                // Consume blank characters.
 
-						if (hasLeadingBlanks && mark.Column < currentIndent && analyzer.IsTab())
-						{
-							throw new SyntaxErrorException(start, mark, "While scanning a plain scalar, find a tab character that violate intendation.");
-						}
+                while (analyzer.IsBlank() || analyzer.IsBreak())
+                {
+                    if (analyzer.IsBlank())
+                    {
+                        // Check for tab character that abuse intendation.
 
-						// Consume a space or a tab character.
+                        if (hasLeadingBlanks && mark.Column < currentIndent && analyzer.IsTab())
+                        {
+                            throw new SyntaxErrorException(start, mark, "While scanning a plain scalar, find a tab character that violate intendation.");
+                        }
 
-						if (!hasLeadingBlanks)
-						{
-							whitespaces.Append(ReadCurrentCharacter());
-						}
-						else
-						{
-							Skip();
-						}
-					}
-					else
-					{
-						// Check if it is a first line break.
+                        // Consume a space or a tab character.
 
-						if (!hasLeadingBlanks)
-						{
-							whitespaces.Length = 0;
-							leadingBreak.Append(ReadLine());
-							hasLeadingBlanks = true;
-						}
-						else
-						{
-							trailingBreaks.Append(ReadLine());
-						}
-					}
-				}
+                        if (!hasLeadingBlanks)
+                        {
+                            whitespaces.Append(ReadCurrentCharacter());
+                        }
+                        else
+                        {
+                            Skip();
+                        }
+                    }
+                    else
+                    {
+                        // Check if it is a first line break.
 
-				// Check intendation level.
+                        if (!hasLeadingBlanks)
+                        {
+                            whitespaces.Length = 0;
+                            leadingBreak.Append(ReadLine());
+                            hasLeadingBlanks = true;
+                        }
+                        else
+                        {
+                            trailingBreaks.Append(ReadLine());
+                        }
+                    }
+                }
 
-				if (flowLevel == 0 && mark.Column < currentIndent)
-				{
-					break;
-				}
-			}
+                // Check intendation level.
 
-			// Note that we change the 'simple_key_allowed' flag.
+                if (flowLevel == 0 && mark.Column < currentIndent)
+                {
+                    break;
+                }
+            }
 
-			if (hasLeadingBlanks)
-			{
-				simpleKeyAllowed = true;
-			}
+            // Note that we change the 'simple_key_allowed' flag.
 
-			// Create a token.
+            if (hasLeadingBlanks)
+            {
+                simpleKeyAllowed = true;
+            }
 
-			return new Scalar(value.ToString(), ScalarStyle.Plain, start, end);
-		}
+            // Create a token.
 
+            return new Scalar(value.ToString(), ScalarStyle.Plain, start, end);
+        }
 
-		/// <summary>
-		/// Remove a potential simple key at the current flow level.
-		/// </summary>
 
-		private void RemoveSimpleKey()
-		{
-			SimpleKey key = simpleKeys.Peek();
+        /// <summary>
+        /// Remove a potential simple key at the current flow level.
+        /// </summary>
 
-			if (key.IsPossible && key.IsRequired)
-			{
-				// If the key is required, it is an error.
+        private void RemoveSimpleKey()
+        {
+            SimpleKey key = simpleKeys.Peek();
 
-				throw new SyntaxErrorException(key.Mark, key.Mark, "While scanning a simple key, could not find expected ':'.");
-			}
+            if (key.IsPossible && key.IsRequired)
+            {
+                // If the key is required, it is an error.
 
-			// Remove the key from the stack.
+                throw new SyntaxErrorException(key.Mark, key.Mark, "While scanning a simple key, could not find expected ':'.");
+            }
 
-			key.IsPossible = false;
-		}
+            // Remove the key from the stack.
 
-		/// <summary>
-		/// Scan the directive name.
-		///
-		/// Scope:
-		///      %YAML   1.1     # a comment \n
-		///       ^^^^
-		///      %TAG    !yaml!  tag:yaml.org,2002:  \n
-		///       ^^^
-		/// </summary>
-		private string ScanDirectiveName(Mark start)
-		{
-			StringBuilder name = new StringBuilder();
+            key.IsPossible = false;
+        }
 
-			// Consume the directive name.
+        /// <summary>
+        /// Scan the directive name.
+        ///
+        /// Scope:
+        ///      %YAML   1.1     # a comment \n
+        ///       ^^^^
+        ///      %TAG    !yaml!  tag:yaml.org,2002:  \n
+        ///       ^^^
+        /// </summary>
+        private string ScanDirectiveName(Mark start)
+        {
+            StringBuilder name = new StringBuilder();
 
-			while (analyzer.IsAlpha())
-			{
-				name.Append(ReadCurrentCharacter());
-			}
+            // Consume the directive name.
 
-			// Check if the name is empty.
+            while (analyzer.IsAlpha())
+            {
+                name.Append(ReadCurrentCharacter());
+            }
 
-			if (name.Length == 0)
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a directive, could not find expected directive name.");
-			}
+            // Check if the name is empty.
 
-			// Check for an blank character after the name.
+            if (name.Length == 0)
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a directive, could not find expected directive name.");
+            }
 
-			if (!analyzer.IsBlankOrBreakOrZero())
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a directive, find unexpected non-alphabetical character.");
-			}
+            // Check for an blank character after the name.
 
-			return name.ToString();
-		}
+            if (!analyzer.IsBlankOrBreakOrZero())
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a directive, find unexpected non-alphabetical character.");
+            }
 
-		private void SkipWhitespaces()
-		{
-			// Eat whitespaces.
+            return name.ToString();
+        }
 
-			while (analyzer.IsBlank())
-			{
-				Skip();
-			}
-		}
+        private void SkipWhitespaces()
+        {
+            // Eat whitespaces.
 
-		/// <summary>
-		/// Scan the value of VERSION-DIRECTIVE.
-		///
-		/// Scope:
-		///      %YAML   1.1     # a comment \n
-		///           ^^^^^^
-		/// </summary>
-		private Token ScanVersionDirectiveValue(Mark start)
-		{
-			SkipWhitespaces();
+            while (analyzer.IsBlank())
+            {
+                Skip();
+            }
+        }
 
-			// Consume the major version number.
+        /// <summary>
+        /// Scan the value of VERSION-DIRECTIVE.
+        ///
+        /// Scope:
+        ///      %YAML   1.1     # a comment \n
+        ///           ^^^^^^
+        /// </summary>
+        private Token ScanVersionDirectiveValue(Mark start)
+        {
+            SkipWhitespaces();
 
-			int major = ScanVersionDirectiveNumber(start);
+            // Consume the major version number.
 
-			// Eat '.'.
+            int major = ScanVersionDirectiveNumber(start);
 
-			if (!analyzer.Check('.'))
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a %YAML directive, did not find expected digit or '.' character.");
-			}
+            // Eat '.'.
 
-			Skip();
+            if (!analyzer.Check('.'))
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a %YAML directive, did not find expected digit or '.' character.");
+            }
 
-			// Consume the minor version number.
+            Skip();
 
-			int minor = ScanVersionDirectiveNumber(start);
+            // Consume the minor version number.
 
-			return new VersionDirective(new Version(major, minor), start, start);
-		}
+            int minor = ScanVersionDirectiveNumber(start);
 
-		/// <summary>
-		/// Scan the value of a TAG-DIRECTIVE token.
-		///
-		/// Scope:
-		///      %TAG    !yaml!  tag:yaml.org,2002:  \n
-		///          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-		/// </summary>
-		private Token ScanTagDirectiveValue(Mark start)
-		{
-			SkipWhitespaces();
+            return new VersionDirective(new Version(major, minor), start, start);
+        }
 
-			// Scan a handle.
+        /// <summary>
+        /// Scan the value of a TAG-DIRECTIVE token.
+        ///
+        /// Scope:
+        ///      %TAG    !yaml!  tag:yaml.org,2002:  \n
+        ///          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        /// </summary>
+        private Token ScanTagDirectiveValue(Mark start)
+        {
+            SkipWhitespaces();
 
-			string handle = ScanTagHandle(true, start);
+            // Scan a handle.
 
-			// Expect a whitespace.
+            string handle = ScanTagHandle(true, start);
 
-			if (!analyzer.IsBlank())
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a %TAG directive, did not find expected whitespace.");
-			}
+            // Expect a whitespace.
 
-			SkipWhitespaces();
+            if (!analyzer.IsBlank())
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a %TAG directive, did not find expected whitespace.");
+            }
 
-			// Scan a prefix.
+            SkipWhitespaces();
 
-			string prefix = ScanTagUri(null, start);
+            // Scan a prefix.
 
-			// Expect a whitespace or line break.
+            string prefix = ScanTagUri(null, start);
 
-			if (!analyzer.IsBlankOrBreakOrZero())
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a %TAG directive, did not find expected whitespace or line break.");
-			}
+            // Expect a whitespace or line break.
 
-			return new TagDirective(handle, prefix, start, start);
-		}
+            if (!analyzer.IsBlankOrBreakOrZero())
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a %TAG directive, did not find expected whitespace or line break.");
+            }
 
-		/// <summary>
-		/// Scan a tag.
-		/// </summary>
+            return new TagDirective(handle, prefix, start, start);
+        }
 
-		private string ScanTagUri(string head, Mark start)
-		{
-			StringBuilder tag = new StringBuilder();
-			if (head != null && head.Length > 1)
-			{
-				tag.Append(head.Substring(1));
-			}
+        /// <summary>
+        /// Scan a tag.
+        /// </summary>
 
-			// Scan the tag.
+        private string ScanTagUri(string head, Mark start)
+        {
+            StringBuilder tag = new StringBuilder();
+            if (head != null && head.Length > 1)
+            {
+                tag.Append(head.Substring(1));
+            }
 
-			// The set of characters that may appear in URI is as follows:
+            // Scan the tag.
 
-			//      '0'-'9', 'A'-'Z', 'a'-'z', '_', '-', ';', '/', '?', ':', '@', '&',
-			//      '=', '+', '$', ',', '.', '!', '~', '*', '\'', '(', ')', '[', ']',
-			//      '%'.
+            // The set of characters that may appear in URI is as follows:
 
+            //      '0'-'9', 'A'-'Z', 'a'-'z', '_', '-', ';', '/', '?', ':', '@', '&',
+            //      '=', '+', '$', ',', '.', '!', '~', '*', '\'', '(', ')', '[', ']',
+            //      '%'.
 
-			while (analyzer.IsAlpha() || analyzer.Check(";/?:@&=+$,.!~*'()[]%"))
-			{
-				// Check if it is a URI-escape sequence.
 
-				if (analyzer.Check('%'))
-				{
-					tag.Append(ScanUriEscapes(start));
-				}
-				else
-				{
-					tag.Append(ReadCurrentCharacter());
-				}
-			}
+            while (analyzer.IsAlpha() || analyzer.Check(";/?:@&=+$,.!~*'()[]%"))
+            {
+                // Check if it is a URI-escape sequence.
 
-			// Check if the tag is non-empty.
+                if (analyzer.Check('%'))
+                {
+                    tag.Append(ScanUriEscapes(start));
+                }
+                else
+                {
+                    tag.Append(ReadCurrentCharacter());
+                }
+            }
 
-			if (tag.Length == 0)
-			{
-				throw new SyntaxErrorException(start, mark, "While parsing a tag, did not find expected tag URI.");
-			}
+            // Check if the tag is non-empty.
 
-			return tag.ToString();
-		}
+            if (tag.Length == 0)
+            {
+                throw new SyntaxErrorException(start, mark, "While parsing a tag, did not find expected tag URI.");
+            }
 
-		/// <summary>
-		/// Decode an URI-escape sequence corresponding to a single UTF-8 character.
-		/// </summary>
+            return tag.ToString();
+        }
 
-		private char ScanUriEscapes(Mark start)
-		{
-			// Decode the required number of characters.
+        /// <summary>
+        /// Decode an URI-escape sequence corresponding to a single UTF-8 character.
+        /// </summary>
 
-			List<byte> charBytes = new List<byte>();
-			int width = 0;
-			do
-			{
-				// Check for a URI-escaped octet.
+        private char ScanUriEscapes(Mark start)
+        {
+            // Decode the required number of characters.
 
-				if (!(analyzer.Check('%') && analyzer.IsHex(1) && analyzer.IsHex(2)))
-				{
-					throw new SyntaxErrorException(start, mark, "While parsing a tag, did not find URI escaped octet.");
-				}
+            List<byte> charBytes = new List<byte>();
+            int width = 0;
+            do
+            {
+                // Check for a URI-escaped octet.
 
-				// Get the octet.
+                if (!(analyzer.Check('%') && analyzer.IsHex(1) && analyzer.IsHex(2)))
+                {
+                    throw new SyntaxErrorException(start, mark, "While parsing a tag, did not find URI escaped octet.");
+                }
 
-				int octet = (analyzer.AsHex(1) << 4) + analyzer.AsHex(2);
+                // Get the octet.
 
-				// If it is the leading octet, determine the length of the UTF-8 sequence.
+                int octet = (analyzer.AsHex(1) << 4) + analyzer.AsHex(2);
 
-				if (width == 0)
-				{
-					width = (octet & 0x80) == 0x00 ? 1 :
-							(octet & 0xE0) == 0xC0 ? 2 :
-							(octet & 0xF0) == 0xE0 ? 3 :
-							(octet & 0xF8) == 0xF0 ? 4 : 0;
+                // If it is the leading octet, determine the length of the UTF-8 sequence.
 
-					if (width == 0)
-					{
-						throw new SyntaxErrorException(start, mark, "While parsing a tag, find an incorrect leading UTF-8 octet.");
-					}
-				}
-				else
-				{
-					// Check if the trailing octet is correct.
+                if (width == 0)
+                {
+                    width = (octet & 0x80) == 0x00 ? 1 :
+                            (octet & 0xE0) == 0xC0 ? 2 :
+                            (octet & 0xF0) == 0xE0 ? 3 :
+                            (octet & 0xF8) == 0xF0 ? 4 : 0;
 
-					if ((octet & 0xC0) != 0x80)
-					{
-						throw new SyntaxErrorException(start, mark, "While parsing a tag, find an incorrect trailing UTF-8 octet.");
-					}
-				}
+                    if (width == 0)
+                    {
+                        throw new SyntaxErrorException(start, mark, "While parsing a tag, find an incorrect leading UTF-8 octet.");
+                    }
+                }
+                else
+                {
+                    // Check if the trailing octet is correct.
 
-				// Copy the octet and move the pointers.
+                    if ((octet & 0xC0) != 0x80)
+                    {
+                        throw new SyntaxErrorException(start, mark, "While parsing a tag, find an incorrect trailing UTF-8 octet.");
+                    }
+                }
 
-				charBytes.Add((byte)octet);
+                // Copy the octet and move the pointers.
 
-				Skip();
-				Skip();
-				Skip();
-			}
-			while (--width > 0);
+                charBytes.Add((byte)octet);
 
-			char[] characters = Encoding.UTF8.GetChars(charBytes.ToArray());
+                Skip();
+                Skip();
+                Skip();
+            }
+            while (--width > 0);
 
-			if (characters.Length != 1)
-			{
-				throw new SyntaxErrorException(start, mark, "While parsing a tag, find an incorrect UTF-8 sequence.");
-			}
+            char[] characters = Encoding.UTF8.GetChars(charBytes.ToArray());
 
-			return characters[0];
-		}
+            if (characters.Length != 1)
+            {
+                throw new SyntaxErrorException(start, mark, "While parsing a tag, find an incorrect UTF-8 sequence.");
+            }
 
-		/// <summary>
-		/// Scan a tag handle.
-		/// </summary>
+            return characters[0];
+        }
 
-		private string ScanTagHandle(bool isDirective, Mark start)
-		{
+        /// <summary>
+        /// Scan a tag handle.
+        /// </summary>
 
-			// Check the initial '!' character.
+        private string ScanTagHandle(bool isDirective, Mark start)
+        {
 
-			if (!analyzer.Check('!'))
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a tag, did not find expected '!'.");
-			}
+            // Check the initial '!' character.
 
-			// Copy the '!' character.
+            if (!analyzer.Check('!'))
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a tag, did not find expected '!'.");
+            }
 
-			StringBuilder tagHandle = new StringBuilder();
-			tagHandle.Append(ReadCurrentCharacter());
+            // Copy the '!' character.
 
-			// Copy all subsequent alphabetical and numerical characters.
+            StringBuilder tagHandle = new StringBuilder();
+            tagHandle.Append(ReadCurrentCharacter());
 
-			while (analyzer.IsAlpha())
-			{
-				tagHandle.Append(ReadCurrentCharacter());
-			}
+            // Copy all subsequent alphabetical and numerical characters.
 
-			// Check if the trailing character is '!' and copy it.
+            while (analyzer.IsAlpha())
+            {
+                tagHandle.Append(ReadCurrentCharacter());
+            }
 
-			if (analyzer.Check('!'))
-			{
-				tagHandle.Append(ReadCurrentCharacter());
-			}
-			else
-			{
+            // Check if the trailing character is '!' and copy it.
 
-				// It's either the '!' tag or not really a tag handle.  If it's a %TAG
-				// directive, it's an error.  If it's a tag token, it must be a part of
-				// URI.
+            if (analyzer.Check('!'))
+            {
+                tagHandle.Append(ReadCurrentCharacter());
+            }
+            else
+            {
 
+                // It's either the '!' tag or not really a tag handle.  If it's a %TAG
+                // directive, it's an error.  If it's a tag token, it must be a part of
+                // URI.
 
-				if (isDirective && (tagHandle.Length != 1 || tagHandle[0] != '!'))
-				{
-					throw new SyntaxErrorException(start, mark, "While parsing a tag directive, did not find expected '!'.");
-				}
-			}
 
-			return tagHandle.ToString();
-		}
+                if (isDirective && (tagHandle.Length != 1 || tagHandle[0] != '!'))
+                {
+                    throw new SyntaxErrorException(start, mark, "While parsing a tag directive, did not find expected '!'.");
+                }
+            }
 
-		/// <summary>
-		/// Scan the version number of VERSION-DIRECTIVE.
-		///
-		/// Scope:
-		///      %YAML   1.1     # a comment \n
-		///              ^
-		///      %YAML   1.1     # a comment \n
-		///                ^
-		/// </summary>
-		private int ScanVersionDirectiveNumber(Mark start)
-		{
-			int value = 0;
-			int length = 0;
+            return tagHandle.ToString();
+        }
 
-			// Repeat while the next character is digit.
+        /// <summary>
+        /// Scan the version number of VERSION-DIRECTIVE.
+        ///
+        /// Scope:
+        ///      %YAML   1.1     # a comment \n
+        ///              ^
+        ///      %YAML   1.1     # a comment \n
+        ///                ^
+        /// </summary>
+        private int ScanVersionDirectiveNumber(Mark start)
+        {
+            int value = 0;
+            int length = 0;
 
-			while (analyzer.IsDigit())
-			{
-				// Check if the number is too long.
+            // Repeat while the next character is digit.
 
-				if (++length > MaxVersionNumberLength)
-				{
-					throw new SyntaxErrorException(start, mark, "While scanning a %YAML directive, find extremely long version number.");
-				}
+            while (analyzer.IsDigit())
+            {
+                // Check if the number is too long.
 
-				value = value * 10 + analyzer.AsDigit();
+                if (++length > MaxVersionNumberLength)
+                {
+                    throw new SyntaxErrorException(start, mark, "While scanning a %YAML directive, find extremely long version number.");
+                }
 
-				Skip();
-			}
+                value = value * 10 + analyzer.AsDigit();
 
-			// Check if the number was present.
+                Skip();
+            }
 
-			if (length == 0)
-			{
-				throw new SyntaxErrorException(start, mark, "While scanning a %YAML directive, did not find expected version number.");
-			}
+            // Check if the number was present.
 
-			return value;
-		}
+            if (length == 0)
+            {
+                throw new SyntaxErrorException(start, mark, "While scanning a %YAML directive, did not find expected version number.");
+            }
 
-		/// <summary>
-		/// Check if a simple key may start at the current position and add it if
-		/// needed.
-		/// </summary>
+            return value;
+        }
 
-		private void SaveSimpleKey()
-		{
+        /// <summary>
+        /// Check if a simple key may start at the current position and add it if
+        /// needed.
+        /// </summary>
 
-			// A simple key is required at the current position if the scanner is in
-			// the block context and the current column coincides with the indentation
-			// level.
+        private void SaveSimpleKey()
+        {
 
+            // A simple key is required at the current position if the scanner is in
+            // the block context and the current column coincides with the indentation
+            // level.
 
-			bool isRequired = (flowLevel == 0 && indent == mark.Column);
 
+            bool isRequired = (flowLevel == 0 && indent == mark.Column);
 
-			// A simple key is required only when it is the first token in the current
-			// line.  Therefore it is always allowed.  But we add a check anyway.
 
+            // A simple key is required only when it is the first token in the current
+            // line.  Therefore it is always allowed.  But we add a check anyway.
 
-			Debug.Assert(simpleKeyAllowed || !isRequired, "Can't require a simple key and disallow it at the same time.");    // Impossible.
 
+            Debug.Assert(simpleKeyAllowed || !isRequired, "Can't require a simple key and disallow it at the same time.");    // Impossible.
 
-			// If the current position may start a simple key, save it.
 
+            // If the current position may start a simple key, save it.
 
-			if (simpleKeyAllowed)
-			{
-				SimpleKey key = new SimpleKey(true, isRequired, tokensParsed + tokens.Count, mark);
 
-				RemoveSimpleKey();
+            if (simpleKeyAllowed)
+            {
+                SimpleKey key = new SimpleKey(true, isRequired, tokensParsed + tokens.Count, mark);
 
-				simpleKeys.Pop();
-				simpleKeys.Push(key);
-			}
-		}
-	}
+                RemoveSimpleKey();
+
+                simpleKeys.Pop();
+                simpleKeys.Push(key);
+            }
+        }
+    }
 }

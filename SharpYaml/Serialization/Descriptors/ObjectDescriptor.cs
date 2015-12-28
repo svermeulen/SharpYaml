@@ -256,7 +256,7 @@ namespace SharpYaml.Serialization.Descriptors
             // Add all public fields
             memberList.AddRange((from fieldInfo in type.GetFields(bindingFlags)
                                  select new FieldDescriptor(fieldInfo, NamingConvention.Comparer)
-                                 into member where PrepareMember(member) select member));
+                                 into member where PrepareMember(member) select member).Cast<IMemberDescriptor>());
 
             // Allow to add dynamic members per type
             if (AttributeRegistry.PrepareMembersCallback != null)
@@ -316,7 +316,7 @@ namespace SharpYaml.Serialization.Descriptors
                     {
                         member.AlternativeNames = new List<string>();
                     }
-                    if (!string.IsNullOrWhiteSpace(yamlRemap.Name))
+                    if (!StringExtension.IsNullOrWhiteSpace(yamlRemap.Name))
                     {
                         member.AlternativeNames.Add(yamlRemap.Name);
                     }
